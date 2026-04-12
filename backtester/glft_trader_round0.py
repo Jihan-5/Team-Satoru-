@@ -3,7 +3,7 @@
 Strategy that scored 1,569 live (submission 82831).
 GLFT = Gueant-Lehalle-Fernandez-Tapia (2012) closed-form market-making quotes.
 """
-from datamodel import OrderDepth, TradingState, Order, ProsperityEncoder, Symbol, Trade
+from datamodel import OrderDepth, TradingState, Order
 import json
 import math
 from typing import Any
@@ -20,48 +20,10 @@ class Logger:
         self.logs += sep.join(map(str, objects)) + end
 
     def flush(self, state: TradingState, orders: dict) -> None:
-        print(json.dumps({
-            "state": self.compress_state(state),
-            "orders": self.compress_orders(orders),
-            "logs": self.logs,
-        }, cls=ProsperityEncoder, separators=(",", ":"), sort_keys=True))
+        if self.logs:
+            print(self.logs, end="")
         self.logs = ""
 
-    def compress_state(self, state: TradingState) -> dict:
-        listings = []
-        for listing in state.listings.values():
-            listings.append([listing["symbol"], listing["product"], listing["denomination"]])
-
-        order_depths = {}
-        for symbol, od in state.order_depths.items():
-            order_depths[symbol] = [od.buy_orders, od.sell_orders]
-
-        return {
-            "t": state.timestamp,
-            "l": listings,
-            "od": order_depths,
-            "ot": self.compress_trades(state.own_trades),
-            "mt": self.compress_trades(state.market_trades),
-            "p": state.position,
-            "o": state.observations,
-        }
-
-    def compress_trades(self, trades: dict) -> list:
-        compressed = []
-        for arr in trades.values():
-            for trade in arr:
-                compressed.append([
-                    trade.symbol, trade.buyer, trade.seller,
-                    trade.price, trade.quantity, trade.timestamp,
-                ])
-        return compressed
-
-    def compress_orders(self, orders: dict) -> list:
-        compressed = []
-        for arr in orders.values():
-            for order in arr:
-                compressed.append([order.symbol, order.price, order.quantity])
-        return compressed
 
 
 logger = Logger()
