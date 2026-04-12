@@ -33,7 +33,7 @@ Per day:
   Day -1:  2,758  (EM 1,363, TM 1,395)
   Day -2:  2,616  (EM 1,234, TM 1,382)
 
-Expected live (using wall_trader's 3,918→1,664 real calibration ratio):
+Expected live (using wall_trader's 3,918->1,664 real calibration ratio):
   ~2,300 Day -1  (vs wall_trader live 1,664 = +640 real SeaShells)
 
 KEY DISCOVERIES (data-driven, not hardcoded):
@@ -45,7 +45,7 @@ KEY DISCOVERIES (data-driven, not hardcoded):
      80 limit. Real constraint is queue surface area.
   5. Multi-level quoting unlocks position capacity by catching fills at
      both the aggressive and deeper price levels.
-  6. L2 mid − L1 mid has 0.6+ correlation with next-tick L1 move. Used as
+  6. L2 mid - L1 mid has 0.6+ correlation with next-tick L1 move. Used as
      sign signal to skew quote level counts on TOMATOES.
 """
 from datamodel import OrderDepth, TradingState, Order
@@ -90,8 +90,10 @@ PARAMS = {
         'disregard_edge': 1,
         'join_edge': 0,
         'default_edge': 1,
-        'soft_position_limit': 40,
+        'soft_position_limit': 10,   # tight base so skew fires
         'levels': 3,
+        'trend_ema_alpha': 0.1,
+        'trend_skew_gain': 20,
     },
 }
 
@@ -248,7 +250,8 @@ class Trader:
         self, product, order_depth, fair_value, position,
         buy_order_volume, sell_order_volume,
         disregard_edge, join_edge, default_edge,
-        manage_position=False, soft_position_limit=0,
+        manage_position=False,
+        soft_limit_long=0, soft_limit_short=0,
         bid_levels=1, ask_levels=1,
     ):
         orders = []
@@ -277,9 +280,9 @@ class Trader:
                 bid = best_bid_below_fair + 1
 
         if manage_position:
-            if position > soft_position_limit:
+            if position > soft_limit_long:
                 ask -= 1
-            elif position < -soft_position_limit:
+            elif position < -soft_limit_short:
                 bid += 1
 
         buy_qty = limit - (position + buy_order_volume)
@@ -367,7 +370,8 @@ class Trader:
                 EMERALD, od, p['fair_value'], pos, bov, sov,
                 p['disregard_edge'], p['join_edge'], p['default_edge'],
                 manage_position=True,
-                soft_position_limit=p['soft_position_limit'],
+                soft_limit_long=p['soft_position_limit'],
+                soft_limit_short=p['soft_position_limit'],
                 bid_levels=lvl, ask_levels=lvl,
             )
             result[EMERALD] = orders + make_orders
@@ -395,6 +399,7 @@ class Trader:
 
                 base_lvl = p.get('levels', 2)
                 bid_lvl = ask_lvl = base_lvl
+                sig = 0.0
                 try:
                     sb = sorted(od.buy_orders.items(), reverse=True)
                     sa = sorted(od.sell_orders.items())
@@ -411,11 +416,23 @@ class Trader:
                 except Exception:
                     pass
 
+                spl_base = p['soft_position_limit']
+                ema_alpha = p.get('trend_ema_alpha', 0.02)
+                prev_trend = trader_obj.get('tomato_trend', 0.0)
+                new_trend = (1 - ema_alpha) * prev_trend + ema_alpha * sig
+                trader_obj['tomato_trend'] = new_trend
+
+                skew = int(round(new_trend * p.get('trend_skew_gain', 20)))
+                skew = max(-30, min(30, skew))
+                soft_long = max(5, min(70, spl_base + skew))
+                soft_short = max(5, min(70, spl_base - skew))
+
                 make_orders, _, _ = self.make_orders(
                     TOMATO, od, fair, pos, bov, sov,
                     p['disregard_edge'], p['join_edge'], p['default_edge'],
                     manage_position=True,
-                    soft_position_limit=p['soft_position_limit'],
+                    soft_limit_long=soft_long,
+                    soft_limit_short=soft_short,
                     bid_levels=bid_lvl, ask_levels=ask_lvl,
                 )
                 result[TOMATO] = orders + make_orders
