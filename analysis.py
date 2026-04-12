@@ -249,14 +249,24 @@ def extract(rows, trades, product, day, day_idx):
 
     pos_tick  = pos_from_fills(fills_raw, ts)
 
+    # ── EMERALDS-specific signals ─────────────────────────────────────────────
+    # bid_dist / ask_dist: how far best bid/ask is from FV (9992→ -8, 10001→ +1)
+    # Positive ask_dist_inv means ask crossed below FV → free take-buy opportunity
+    em_bid_dist     = np.where(np.isnan(bp1), np.nan, bp1 - EMERALD_FV)
+    em_ask_dist     = np.where(np.isnan(ap1), np.nan, ap1 - EMERALD_FV)
+    em_take_buy     = (~np.isnan(ap1)) & (ap1 < EMERALD_FV)   # ask below FV
+    em_take_sell    = (~np.isnan(bp1)) & (bp1 > EMERALD_FV)   # bid above FV
+    em_spread       = np.where(~(np.isnan(ap1) | np.isnan(bp1)), ap1 - bp1, np.nan)
+
     # Algo action: 0=warmup/idle, 1=neutral posting, 2=bearish posting
     if product == "TOMATOES":
         action = np.ones(len(ts), int)
         action[:WARMUP_TICKS] = 0
         action[(np.arange(len(ts)) >= WARMUP_TICKS) & (reg >= 1)] = 2
-    else:  # EMERALDS
+    else:  # EMERALDS: 0=take opportunity, 1=making passive, 2=near limit
         action = np.ones(len(ts), int)
-        action[np.abs(pos_tick) > int(POS_LIMIT * 0.75)] = 2   # near limit → taking mode
+        action[em_take_buy | em_take_sell] = 0
+        action[np.abs(pos_tick) > int(POS_LIMIT * 0.75)] = 2
 
     # Target position
     if product == "TOMATOES":
@@ -283,6 +293,10 @@ def extract(rows, trades, product, day, day_idx):
         reg=reg, imbalance=imbalance,
         pos=pos_tick, target=target, action=action,
         fills=fills_raw,
+        # EMERALDS-specific
+        em_bid_dist=em_bid_dist, em_ask_dist=em_ask_dist,
+        em_take_buy=em_take_buy, em_take_sell=em_take_sell,
+        em_spread=em_spread,
         total_fills=len(fills_raw),
         total_volume=sum(abs(f["qty"]) for f in fills_raw),
         final_pnl=float(pnl[-1]) if len(pnl) else 0.0,
@@ -302,14 +316,20 @@ REGIME_BG = {
     4: "rgba(21,128,62,0.12)",
 }
 ACTION_COLORS = {
-    0: "rgba(100,116,139,0.55)",   # gray — warmup/idle
-    1: "rgba(56,189,248,0.45)",    # sky blue — neutral posting
-    2: "rgba(249,115,22,0.55)",    # orange — bearish posting
+    0: "rgba(100,116,139,0.55)",   # gray — warmup/idle  OR  emerald take opportunity
+    1: "rgba(56,189,248,0.45)",    # sky blue — neutral/making posting
+    2: "rgba(249,115,22,0.55)",    # orange — bearish posting  OR  near limit
 }
-ACTION_LABELS = {
+
+ACTION_LABELS_TOMATOES = {
     0: "Warmup / idle",
     1: "Passive MM — neutral (L1/L1)",
     2: "Passive MM — bearish (deep bid + L1 ask)",
+}
+ACTION_LABELS_EMERALDS = {
+    0: "Take opportunity (crossing FV=10000)",
+    1: "Making — posting 9992 / 10008",
+    2: "Near position limit (|pos| > 60)",
 }
 
 
@@ -374,6 +394,7 @@ def build_figure(d, product, day):
     )
 
     # ── Master hover aggregator (invisible, on price panel) ───────────────────
+    is_em = (product == "EMERALDS")
     cdata = np.column_stack([
         d["mid"],
         np.where(np.isnan(d["bp1"]), 0, d["bp1"]),
@@ -384,22 +405,35 @@ def build_figure(d, product, day):
         d["pos"].astype(float),
         pnl,
         d["rpnl"],
+        np.where(np.isnan(d["em_bid_dist"]), 0, d["em_bid_dist"]),
+        np.where(np.isnan(d["em_ask_dist"]), 0, d["em_ask_dist"]),
     ])
-    REG_LABEL = ["Neutral","Mild bear","Strong bear","Mild bull","Strong bull"]
-    reg_labels = [REG_LABEL[r] for r in d["reg"]]
 
-    MASTER_HOVER = (
-        "<b>t = %{x:.1f}s</b><br>"
-        "Mid: %{customdata[0]:.2f}<br>"
-        "Bid: %{customdata[1]:.2f}  ·  Ask: %{customdata[2]:.2f}<br>"
-        "EMA fast: %{customdata[3]:.4f}<br>"
-        "EMA slow: %{customdata[4]:.4f}<br>"
-        "EMA diff: %{customdata[5]:.4f}<br>"
-        "Position: %{customdata[6]:.0f}<br>"
-        "Total PnL: %{customdata[7]:.0f}<br>"
-        "Realized PnL: %{customdata[8]:.0f}"
-        "<extra></extra>"
-    )
+    if is_em:
+        MASTER_HOVER = (
+            "<b>t = %{x:.1f}s</b><br>"
+            "Mid: %{customdata[0]:.2f}  FV=10000<br>"
+            "Bid: %{customdata[1]:.2f}  ·  Ask: %{customdata[2]:.2f}<br>"
+            "Bid dist from FV: %{customdata[9]:+.2f}<br>"
+            "Ask dist from FV: %{customdata[10]:+.2f}<br>"
+            "Position: %{customdata[6]:.0f}<br>"
+            "Total PnL: %{customdata[7]:.0f}<br>"
+            "Realized PnL: %{customdata[8]:.0f}"
+            "<extra></extra>"
+        )
+    else:
+        MASTER_HOVER = (
+            "<b>t = %{x:.1f}s</b><br>"
+            "Mid: %{customdata[0]:.2f}<br>"
+            "Bid: %{customdata[1]:.2f}  ·  Ask: %{customdata[2]:.2f}<br>"
+            "EMA fast: %{customdata[3]:.4f}<br>"
+            "EMA slow: %{customdata[4]:.4f}<br>"
+            "EMA diff: %{customdata[5]:.4f}<br>"
+            "Position: %{customdata[6]:.0f}<br>"
+            "Total PnL: %{customdata[7]:.0f}<br>"
+            "Realized PnL: %{customdata[8]:.0f}"
+            "<extra></extra>"
+        )
     fig.add_trace(go.Scatter(
         x=ts.tolist(), y=d["mid"].tolist(),
         mode="markers",
@@ -432,6 +466,29 @@ def build_figure(d, product, day):
             hoverinfo="skip",
         ), row=1, col=1)
 
+    # EMERALDS: FV reference line + take-opportunity highlights
+    if is_em:
+        fig.add_shape(type="line",
+                      x0=float(ts[0]), x1=float(ts[-1]),
+                      y0=EMERALD_FV, y1=EMERALD_FV,
+                      line=dict(color="#fbbf24", width=1.2, dash="dot"),
+                      row=1, col=1)
+        fig.add_annotation(x=float(ts[-1]), y=EMERALD_FV,
+                           text=" FV=10000", font=dict(size=8, color="#fbbf24"),
+                           showarrow=False, xanchor="left", row=1, col=1)
+        # Shade take-buy windows (ask < FV) — bright green flash
+        buy_spans = _build_spans(d["em_take_buy"].astype(int), ts)
+        for x0, x1, v in buy_spans:
+            if v == 1:
+                fig.add_vrect(x0=x0, x1=x1, fillcolor="rgba(74,222,128,0.25)",
+                              layer="above", line_width=0, row=1, col=1)
+        # Shade take-sell windows (bid > FV) — bright red flash
+        sell_spans = _build_spans(d["em_take_sell"].astype(int), ts)
+        for x0, x1, v in sell_spans:
+            if v == 1:
+                fig.add_vrect(x0=x0, x1=x1, fillcolor="rgba(248,113,113,0.25)",
+                              layer="above", line_width=0, row=1, col=1)
+
     # Best bid / ask — thin, translucent
     fig.add_trace(go.Scatter(
         x=ts.tolist(), y=d["bp1"].tolist(), mode="lines",
@@ -444,20 +501,35 @@ def build_figure(d, product, day):
         name="Best ask", hoverinfo="skip",
     ), row=1, col=1)
 
-    # EMA fast — bright yellow, prominent
-    fig.add_trace(go.Scatter(
-        x=ts.tolist(), y=d["fast"].tolist(), mode="lines",
-        line=dict(color="#facc15", width=2.5),
-        name=f"EMA {EMA_FAST_N} (fast)",
-        hovertemplate=f"EMA{EMA_FAST_N}: %{{y:.3f}}<extra></extra>",
-    ), row=1, col=1)
-    # EMA slow — bright purple, prominent
-    fig.add_trace(go.Scatter(
-        x=ts.tolist(), y=d["slow"].tolist(), mode="lines",
-        line=dict(color="#c084fc", width=2.5),
-        name=f"EMA {EMA_SLOW_N} (slow)",
-        hovertemplate=f"EMA{EMA_SLOW_N}: %{{y:.3f}}<extra></extra>",
-    ), row=1, col=1)
+    if is_em:
+        # EMERALDS: show our passive quote levels instead of EMAs
+        for lvl, clr, nm in [
+            (EMERALD_FV - EMERALD_OFFSET, "#4ade80", f"Our bid ({EMERALD_FV - EMERALD_OFFSET})"),
+            (EMERALD_FV + EMERALD_OFFSET, "#f87171", f"Our ask ({EMERALD_FV + EMERALD_OFFSET})"),
+        ]:
+            fig.add_shape(type="line",
+                          x0=float(ts[0]), x1=float(ts[-1]),
+                          y0=lvl, y1=lvl,
+                          line=dict(color=clr, width=1.5, dash="dash"),
+                          row=1, col=1)
+            fig.add_annotation(x=float(ts[-1]), y=lvl,
+                               text=f" {nm}", font=dict(size=8, color=clr),
+                               showarrow=False, xanchor="left", row=1, col=1)
+    else:
+        # EMA fast — bright yellow, prominent
+        fig.add_trace(go.Scatter(
+            x=ts.tolist(), y=d["fast"].tolist(), mode="lines",
+            line=dict(color="#facc15", width=2.5),
+            name=f"EMA {EMA_FAST_N} (fast)",
+            hovertemplate=f"EMA{EMA_FAST_N}: %{{y:.3f}}<extra></extra>",
+        ), row=1, col=1)
+        # EMA slow — bright purple, prominent
+        fig.add_trace(go.Scatter(
+            x=ts.tolist(), y=d["slow"].tolist(), mode="lines",
+            line=dict(color="#c084fc", width=2.5),
+            name=f"EMA {EMA_SLOW_N} (slow)",
+            hovertemplate=f"EMA{EMA_SLOW_N}: %{{y:.3f}}<extra></extra>",
+        ), row=1, col=1)
 
     # Mid price — main focus, thick dark line
     fig.add_trace(go.Scatter(
@@ -534,7 +606,8 @@ def build_figure(d, product, day):
     add_vrects_from_spans(fig, action_spans, ACTION_COLORS, row=2)
 
     # Legend entries for algo action (invisible dots in legend)
-    for val, label in ACTION_LABELS.items():
+    action_labels = ACTION_LABELS_EMERALDS if is_em else ACTION_LABELS_TOMATOES
+    for val, label in action_labels.items():
         color = ACTION_COLORS[val].replace("0.55", "0.8").replace("0.45", "0.8")
         fig.add_trace(go.Scatter(
             x=[None], y=[None], mode="markers",
@@ -649,50 +722,101 @@ def build_figure(d, product, day):
         ), row=4, col=1)
 
     # ══════════════════════════════════
-    #  ROW 5: SIGNAL PANEL
+    #  ROW 5: SIGNAL PANEL  (product-specific)
     # ══════════════════════════════════
 
-    diff_arr = d["diff"]
-
-    # Threshold lines with labels
-    for thr, clr, lbl in [
-        ( STRONG_THR, "#22c55e",  f"+STRONG = {STRONG_THR}"),
-        ( MILD_THR,   "#86efac",  f"+MILD = {MILD_THR}"),
-        ( 0,          "#475569",  "0"),
-        (-MILD_THR,   "#fca5a5",  f"−MILD = {MILD_THR}"),
-        (-STRONG_THR, "#ef4444",  f"−STRONG = {STRONG_THR}"),
-    ]:
+    if is_em:
+        # ── EMERALDS signal: bid/ask distance from FV ─────────────────────────
+        # bid_dist = bp1 − 10000  (normally ~ −8; positive = bid crossed FV → free edge)
+        # ask_dist = ap1 − 10000  (normally ~ +8; negative = ask crossed FV → free edge)
         fig.add_shape(type="line",
-                      x0=float(ts[0]), x1=float(ts[-1]),
-                      y0=float(thr), y1=float(thr),
-                      line=dict(color=clr, width=0.8, dash="dash"),
+                      x0=float(ts[0]), x1=float(ts[-1]), y0=0, y1=0,
+                      line=dict(color="#fbbf24", width=1.0, dash="dash"),
                       row=5, col=1)
-        if thr != 0:
-            fig.add_annotation(
-                x=float(ts[-1]), y=float(thr),
-                text=f" {lbl}",
-                font=dict(size=8, color=clr),
-                showarrow=False, xanchor="left", yanchor="middle",
-                row=5, col=1,
-            )
+        fig.add_annotation(x=float(ts[-1]), y=0, text=" FV crossing",
+                           font=dict(size=8, color="#fbbf24"),
+                           showarrow=False, xanchor="left", row=5, col=1)
+        for lvl, clr, lbl in [
+            (-EMERALD_OFFSET, "#4ade80", f" Our bid dist (−{EMERALD_OFFSET})"),
+            ( EMERALD_OFFSET, "#f87171", f" Our ask dist (+{EMERALD_OFFSET})"),
+        ]:
+            fig.add_shape(type="line",
+                          x0=float(ts[0]), x1=float(ts[-1]), y0=lvl, y1=lvl,
+                          line=dict(color=clr, width=0.8, dash="dot"),
+                          row=5, col=1)
+            fig.add_annotation(x=float(ts[-1]), y=lvl, text=lbl,
+                               font=dict(size=8, color=clr),
+                               showarrow=False, xanchor="left", row=5, col=1)
 
-    # EMA diff line
-    fig.add_trace(go.Scatter(
-        x=ts.tolist(), y=diff_arr.tolist(),
-        mode="lines", line=dict(color="#facc15", width=1.8),
-        name="EMA diff (fast−slow)",
-        hovertemplate="Diff: %{y:.4f}<extra></extra>",
-    ), row=5, col=1)
+        fig.add_trace(go.Scatter(
+            x=ts.tolist(), y=d["em_bid_dist"].tolist(),
+            mode="lines", line=dict(color="#38bdf8", width=1.8),
+            name="Best bid − FV",
+            hovertemplate="Bid dist: %{y:+.2f}<extra></extra>",
+        ), row=5, col=1)
+        fig.add_trace(go.Scatter(
+            x=ts.tolist(), y=d["em_ask_dist"].tolist(),
+            mode="lines", line=dict(color="#f87171", width=1.8),
+            name="Best ask − FV",
+            hovertemplate="Ask dist: %{y:+.2f}<extra></extra>",
+        ), row=5, col=1)
 
-    # L1 volume imbalance on secondary y
-    fig.add_trace(go.Scatter(
-        x=ts.tolist(), y=d["imbalance"].tolist(),
-        mode="lines",
-        line=dict(color="#38bdf8", width=0.8, dash="dot"),
-        name="L1 vol imbalance",
-        opacity=0.55,
-        hovertemplate="Imbalance: %{y:.2f}<extra></extra>",
-    ), row=5, col=1, secondary_y=True)
+        # Spread (ap1 − bp1) on secondary y
+        fig.add_trace(go.Scatter(
+            x=ts.tolist(), y=d["em_spread"].tolist(),
+            mode="lines", line=dict(color="#a78bfa", width=0.9, dash="dot"),
+            name="Market spread (ask−bid)",
+            opacity=0.65,
+            hovertemplate="Spread: %{y:.2f}<extra></extra>",
+        ), row=5, col=1, secondary_y=True)
+
+        fig.update_yaxes(title_text="Dist from FV", row=5, col=1, secondary_y=False)
+        fig.update_yaxes(title_text="Spread",        row=5, col=1, secondary_y=True,
+                         range=[0, 30],
+                         tickfont=dict(color="#a78bfa", size=9),
+                         gridcolor="#1e3a5f")
+
+    else:
+        # ── TOMATOES signal: EMA diff + imbalance ─────────────────────────────
+        for thr, clr, lbl in [
+            ( STRONG_THR, "#22c55e",  f"+STRONG = {STRONG_THR}"),
+            ( MILD_THR,   "#86efac",  f"+MILD = {MILD_THR}"),
+            ( 0,          "#475569",  "0"),
+            (-MILD_THR,   "#fca5a5",  f"−MILD = {MILD_THR}"),
+            (-STRONG_THR, "#ef4444",  f"−STRONG = {STRONG_THR}"),
+        ]:
+            fig.add_shape(type="line",
+                          x0=float(ts[0]), x1=float(ts[-1]),
+                          y0=float(thr), y1=float(thr),
+                          line=dict(color=clr, width=0.8, dash="dash"),
+                          row=5, col=1)
+            if thr != 0:
+                fig.add_annotation(
+                    x=float(ts[-1]), y=float(thr),
+                    text=f" {lbl}", font=dict(size=8, color=clr),
+                    showarrow=False, xanchor="left", yanchor="middle",
+                    row=5, col=1,
+                )
+
+        fig.add_trace(go.Scatter(
+            x=ts.tolist(), y=d["diff"].tolist(),
+            mode="lines", line=dict(color="#facc15", width=1.8),
+            name="EMA diff (fast−slow)",
+            hovertemplate="Diff: %{y:.4f}<extra></extra>",
+        ), row=5, col=1)
+
+        fig.add_trace(go.Scatter(
+            x=ts.tolist(), y=d["imbalance"].tolist(),
+            mode="lines", line=dict(color="#38bdf8", width=0.8, dash="dot"),
+            name="L1 vol imbalance", opacity=0.55,
+            hovertemplate="Imbalance: %{y:.2f}<extra></extra>",
+        ), row=5, col=1, secondary_y=True)
+
+        fig.update_yaxes(title_text="EMA diff",  row=5, col=1, secondary_y=False)
+        fig.update_yaxes(title_text="Imbalance", row=5, col=1, secondary_y=True,
+                         range=[-1.5, 1.5],
+                         tickfont=dict(color="#38bdf8", size=9),
+                         gridcolor="#1e3a5f")
 
     # ══════════════════════════════════
     #  GLOBAL LAYOUT
@@ -730,17 +854,12 @@ def build_figure(d, product, day):
 
     # Per-axis customisation
     fig.update_yaxes(title_text="Price",    row=1, col=1)
-    fig.update_yaxes(row=2, col=1,          # algo strip — hide y
+    fig.update_yaxes(row=2, col=1,
                      showticklabels=False, showgrid=False,
                      zeroline=False, showline=False, range=[0, 1])
-    fig.update_yaxes(title_text="Position", row=3, col=1,
-                     range=[y_lo, y_hi])
+    fig.update_yaxes(title_text="Position", row=3, col=1, range=[y_lo, y_hi])
     fig.update_yaxes(title_text="P&L",      row=4, col=1)
-    fig.update_yaxes(title_text="EMA diff", row=5, col=1, secondary_y=False)
-    fig.update_yaxes(title_text="Imbalance", row=5, col=1, secondary_y=True,
-                     range=[-1.5, 1.5],
-                     tickfont=dict(color="#38bdf8", size=9),
-                     gridcolor="#1e3a5f")
+    # Row 5 y-axis titles set inside the product-specific branches above
     fig.update_xaxes(title_text="Time (seconds into day)", row=5, col=1)
 
     return fig
@@ -762,15 +881,21 @@ def make_html(fig, d, product, day) -> str:
 
     em_note = ""
     if product == "EMERALDS":
-        em_note = """
+        take_buys  = int(np.sum(d["em_take_buy"]))
+        take_sells = int(np.sum(d["em_take_sell"]))
+        em_note = f"""
 <div style="background:#1c2f4a;border:1px solid #334155;border-radius:6px;
             padding:10px 16px;margin-top:10px;font-size:12px;color:#94a3b8;">
-  ⚡ <b style="color:#f1f5f9">EMERALDS note:</b>
-  Price is pegged at FV&nbsp;=&nbsp;10&nbsp;000 — EMA diff stays near zero, regime
-  classification is unused.  Strategy always posts passive quotes at
-  FV&nbsp;±&nbsp;8&nbsp;(bid&nbsp;9992&nbsp;/&nbsp;ask&nbsp;10008).
-  Fills happen when other participants' orders cross our passive quotes.
-  Signal panel shows EMA diff for completeness but it has no decision value here.
+  ⚡ <b style="color:#f1f5f9">EMERALDS — Stoikov market maker on a pegged price</b><br>
+  FV = 10,000 (fixed). Strategy posts passive quotes at bid&nbsp;9992 / ask&nbsp;10008
+  (+8 ticks each side) and takes any order that crosses FV.<br><br>
+  <b style="color:#4ade80">Green flashes</b> on price panel = ask &lt; FV
+  (free buy opportunity) — {take_buys} ticks<br>
+  <b style="color:#f87171">Red flashes</b> = bid &gt; FV
+  (free sell opportunity) — {take_sells} ticks<br>
+  <b>Signal panel</b>: bid/ask distance from FV (should sit at −8/+8; crossings = free edge)
+  + market spread on secondary axis.<br>
+  Algo action strip: gray = take opportunity, blue = making passive, orange = near limit.
 </div>"""
 
     summary = f"""
