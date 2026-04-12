@@ -869,13 +869,8 @@ def build_figure(d, product, day):
 # 6.  HTML OUTPUT
 # ══════════════════════════════════════════════════════════════════════════════
 
-def make_html(fig, d, product, day) -> str:
-    chart_html = fig.to_html(
-        full_html=False, include_plotlyjs="cdn",
-        config={"scrollZoom": True, "displaylogo": False,
-                "modeBarButtonsToRemove": ["lasso2d", "select2d"]},
-    )
-
+def _summary_html(d, product, day) -> str:
+    """Build the per-day stats block (returned as an HTML string)."""
     rt   = d["regime_time"]
     ttot = max(sum(rt.values()), 1)
 
@@ -883,83 +878,133 @@ def make_html(fig, d, product, day) -> str:
     if product == "EMERALDS":
         take_buys  = int(np.sum(d["em_take_buy"]))
         take_sells = int(np.sum(d["em_take_sell"]))
-        em_note = f"""
-<div style="background:#1c2f4a;border:1px solid #334155;border-radius:6px;
-            padding:10px 16px;margin-top:10px;font-size:12px;color:#94a3b8;">
-  ⚡ <b style="color:#f1f5f9">EMERALDS — Stoikov market maker on a pegged price</b><br>
-  FV = 10,000 (fixed). Strategy posts passive quotes at bid&nbsp;9992 / ask&nbsp;10008
-  (+8 ticks each side) and takes any order that crosses FV.<br><br>
-  <b style="color:#4ade80">Green flashes</b> on price panel = ask &lt; FV
-  (free buy opportunity) — {take_buys} ticks<br>
-  <b style="color:#f87171">Red flashes</b> = bid &gt; FV
-  (free sell opportunity) — {take_sells} ticks<br>
-  <b>Signal panel</b>: bid/ask distance from FV (should sit at −8/+8; crossings = free edge)
-  + market spread on secondary axis.<br>
-  Algo action strip: gray = take opportunity, blue = making passive, orange = near limit.
-</div>"""
+        em_note = (
+            f'<div style="background:#1c2f4a;border:1px solid #334155;border-radius:6px;'
+            f'padding:10px 16px;margin-top:10px;font-size:12px;color:#94a3b8;">'
+            f'⚡ <b style="color:#f1f5f9">EMERALDS — Stoikov MM on a pegged price</b><br>'
+            f'FV=10,000. Passive quotes: bid 9992 / ask 10008 (±8 ticks).<br>'
+            f'<b style="color:#4ade80">Green flashes</b>: ask&lt;FV (take-buy) — {take_buys} ticks · '
+            f'<b style="color:#f87171">Red flashes</b>: bid&gt;FV (take-sell) — {take_sells} ticks<br>'
+            f'Signal panel: bid/ask dist from FV + market spread. '
+            f'Algo strip: gray=take opp, blue=making, orange=near limit.</div>'
+        )
 
-    summary = f"""
-<div style="font-family:monospace;background:#1e293b;color:#cbd5e1;
-            padding:18px 28px;border-radius:8px;margin:18px auto;
-            max-width:900px;line-height:1.9;font-size:13px;">
-  <b style="color:#f1f5f9;font-size:15px;">{product} · Day {day:+d} · Summary</b>
-  {em_note}
-  <br>
-  <table style="border-collapse:collapse;width:100%;margin-top:6px">
-    <tr>
-      <td style="padding:2px 20px 2px 0;color:#94a3b8">Total fills</td>
-      <td><b style="color:#f1f5f9">{d['total_fills']}</b></td>
-      <td style="padding:2px 20px 2px 28px;color:#94a3b8">Total volume</td>
-      <td><b style="color:#f1f5f9">{d['total_volume']}</b></td>
-    </tr>
-    <tr>
-      <td style="color:#94a3b8">Final PnL</td>
-      <td><b style="color:#4ade80">{d['final_pnl']:+,.0f}</b></td>
-      <td style="padding:2px 20px 2px 28px;color:#94a3b8">Max drawdown</td>
-      <td><b style="color:#f87171">{d['drawdown']:,.0f}</b></td>
-    </tr>
-  </table>
-  <br>
-  <b style="color:#94a3b8">Time in regime (MILD_THR={MILD_THR}, STRONG_THR={STRONG_THR}):</b><br>
-  <span style="color:#64748b">&nbsp; Neutral&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
-  </span><b>{rt['neutral']:.0f}s ({rt['neutral']/ttot*100:.0f}%)</b><br>
-  <span style="color:#fca5a5">&nbsp; Mild bearish &nbsp;
-  </span><b>{rt['mild_bearish']:.0f}s ({rt['mild_bearish']/ttot*100:.0f}%)</b><br>
-  <span style="color:#ef4444">&nbsp; Strong bearish
-  </span><b>{rt['strong_bearish']:.0f}s ({rt['strong_bearish']/ttot*100:.0f}%)</b><br>
-  <span style="color:#86efac">&nbsp; Mild bullish &nbsp;
-  </span><b>{rt['mild_bullish']:.0f}s ({rt['mild_bullish']/ttot*100:.0f}%)</b><br>
-  <span style="color:#4ade80">&nbsp; Strong bullish
-  </span><b>{rt['strong_bullish']:.0f}s ({rt['strong_bullish']/ttot*100:.0f}%)</b>
-</div>"""
+    return (
+        f'<div style="font-family:monospace;background:#1e293b;color:#cbd5e1;'
+        f'padding:16px 28px;border-radius:8px;line-height:1.85;font-size:13px;">'
+        f'<b style="color:#f1f5f9;font-size:14px;">{product} · Day {day:+d} · Summary</b>'
+        f'{em_note}<br>'
+        f'<table style="border-collapse:collapse;width:100%;margin-top:4px">'
+        f'<tr><td style="padding:2px 18px 2px 0;color:#94a3b8">Total fills</td>'
+        f'<td><b style="color:#f1f5f9">{d["total_fills"]}</b></td>'
+        f'<td style="padding:2px 18px 2px 24px;color:#94a3b8">Total volume</td>'
+        f'<td><b style="color:#f1f5f9">{d["total_volume"]}</b></td></tr>'
+        f'<tr><td style="color:#94a3b8">Final PnL</td>'
+        f'<td><b style="color:#4ade80">{d["final_pnl"]:+,.0f}</b></td>'
+        f'<td style="padding:2px 18px 2px 24px;color:#94a3b8">Max drawdown</td>'
+        f'<td><b style="color:#f87171">{d["drawdown"]:,.0f}</b></td></tr>'
+        f'</table><br>'
+        f'<b style="color:#94a3b8">Regime (MILD={MILD_THR}, STRONG={STRONG_THR}):</b><br>'
+        f'<span style="color:#64748b"> Neutral </span><b>{rt["neutral"]:.0f}s ({rt["neutral"]/ttot*100:.0f}%)</b> · '
+        f'<span style="color:#fca5a5">Mild bear </span><b>{rt["mild_bearish"]:.0f}s ({rt["mild_bearish"]/ttot*100:.0f}%)</b> · '
+        f'<span style="color:#ef4444">Strong bear </span><b>{rt["strong_bearish"]:.0f}s ({rt["strong_bearish"]/ttot*100:.0f}%)</b><br>'
+        f'<span style="color:#86efac">Mild bull </span><b>{rt["mild_bullish"]:.0f}s ({rt["mild_bullish"]/ttot*100:.0f}%)</b> · '
+        f'<span style="color:#4ade80">Strong bull </span><b>{rt["strong_bullish"]:.0f}s ({rt["strong_bullish"]/ttot*100:.0f}%)</b>'
+        f'</div>'
+    )
+
+
+def make_combined_html(days_data: list, product: str) -> str:
+    """
+    days_data: list of (day, d, fig) tuples — one per day.
+    Returns a single HTML with a dropdown to switch between days.
+    Uses Plotly.react() to swap figures without reloading.
+    """
+    import json as _json
+
+    options_html = "\n".join(
+        f'    <option value="{i}">Day {day:+d}</option>'
+        for i, (day, _, _) in enumerate(days_data)
+    )
+
+    summaries_js = _json.dumps({
+        str(i): _summary_html(d, product, day)
+        for i, (day, d, _) in enumerate(days_data)
+    })
+
+    # Serialize each figure to JSON for Plotly.react()
+    figs_js = "[\n" + ",\n".join(
+        fig.to_json() for _, _, fig in days_data
+    ) + "\n]"
+
+    hint = "↓ Price · Algo action · Position · P&amp;L · Signal"
+    if product == "TOMATOES":
+        hint += " (EMA diff + imbalance)"
+    else:
+        hint += " (bid/ask dist from FV + spread)"
 
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>IMC P4 · {product} Day {day:+d}</title>
+  <title>IMC P4 · {product}</title>
+  <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
   <style>
-    * {{box-sizing:border-box;margin:0;padding:0;}}
-    body {{background:#0f172a;}}
-    .hdr {{background:#1e293b;border-bottom:1px solid #334155;
-           padding:14px 28px;color:#f1f5f9;font-family:monospace;
-           display:flex;align-items:center;justify-content:space-between;}}
-    .hdr h1 {{font-size:1.05rem;}}
-    .hdr span {{font-size:0.8rem;color:#64748b;}}
-    .hint {{text-align:center;font-family:monospace;font-size:0.75rem;
-            color:#475569;padding:4px;}}
+    *{{box-sizing:border-box;margin:0;padding:0;}}
+    body{{background:#0f172a;font-family:monospace;}}
+    .hdr{{background:#1e293b;border-bottom:1px solid #334155;
+          padding:14px 28px;display:flex;align-items:center;
+          justify-content:space-between;gap:20px;}}
+    .hdr h1{{font-size:1.05rem;color:#f1f5f9;}}
+    .hdr-right{{display:flex;align-items:center;gap:14px;}}
+    .hdr span{{font-size:0.8rem;color:#64748b;}}
+    select#day-select{{
+      background:#0f172a;color:#f1f5f9;border:1px solid #475569;
+      border-radius:6px;padding:6px 28px 6px 12px;font-size:0.95rem;
+      font-family:monospace;cursor:pointer;outline:none;
+      appearance:none;-webkit-appearance:none;
+      background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath fill='%2394a3b8' d='M6 8L0 0h12z'/%3E%3C/svg%3E");
+      background-repeat:no-repeat;background-position:right 10px center;
+    }}
+    select#day-select:hover{{border-color:#7c3aed;}}
+    #summary-box{{padding:12px 28px;}}
+    .hint{{text-align:center;font-size:0.75rem;color:#475569;padding:3px;}}
+    #chart-div{{width:100%;}}
   </style>
 </head>
 <body>
   <div class="hdr">
-    <h1>IMC Prosperity 4 · Round 0 · {product} · Day {day:+d}</h1>
-    <span>Hover → spike crosshair on all panels · Scroll to zoom · Drag to pan</span>
+    <h1>IMC Prosperity 4 · Round 0 · {product}</h1>
+    <div class="hdr-right">
+      <select id="day-select">{options_html}
+      </select>
+      <span>Hover → crosshair · Scroll = zoom · Drag = pan</span>
+    </div>
   </div>
-  {summary}
-  <div class="hint">
-    ↓ Price · Algo action · Position · P&amp;L · Signal (EMA diff + imbalance)
-  </div>
-  {chart_html}
+
+  <div id="summary-box"></div>
+  <div class="hint">{hint}</div>
+  <div id="chart-div"></div>
+
+  <script>
+    const FIGS     = {figs_js};
+    const SUMMARIES = {summaries_js};
+    const CONFIG   = {{scrollZoom:true,displaylogo:false,
+                       modeBarButtonsToRemove:["lasso2d","select2d"]}};
+
+    function switchDay(idx) {{
+      const f = FIGS[idx];
+      Plotly.react("chart-div", f.data, f.layout, CONFIG);
+      document.getElementById("summary-box").innerHTML = SUMMARIES[String(idx)];
+    }}
+
+    document.getElementById("day-select").addEventListener("change", function() {{
+      switchDay(parseInt(this.value));
+    }});
+
+    // Initial render
+    switchDay(0);
+  </script>
 </body>
 </html>"""
 
@@ -983,6 +1028,7 @@ def main():
     print(f"Days found: {days}\n")
 
     for product in ["EMERALDS", "TOMATOES"]:
+        days_data = []   # list of (day, d, fig)
         for day_idx, day in enumerate(days):
             label = f"{product} Day {day:+d}"
             print(f"  [{label}]  extracting…", end=" ", flush=True)
@@ -990,20 +1036,24 @@ def main():
             if d is None:
                 print("no data — skipped.")
                 continue
-            print(f"fills={d['total_fills']}  vol={d['total_volume']}  "
-                  f"PnL={d['final_pnl']:+,.0f}", end="  |  building chart…", flush=True)
-            fig  = build_figure(d, product, day)
-            html = make_html(fig, d, product, day)
-            fname = f"analysis_{product}_day{day}.html"
-            with open(fname, "w") as f:
-                f.write(html)
-            print(f"→ {fname}")
+            print(f"fills={d['total_fills']}  PnL={d['final_pnl']:+,.0f}",
+                  end="  building…", flush=True)
+            fig = build_figure(d, product, day)
+            days_data.append((day, d, fig))
+            print(" ✓")
 
-    print("\nAll done. Open 4 HTML files in your browser.")
-    print("  analysis_EMERALDS_day-2.html")
-    print("  analysis_EMERALDS_day-1.html")
-    print("  analysis_TOMATOES_day-2.html")
-    print("  analysis_TOMATOES_day-1.html")
+        if not days_data:
+            continue
+
+        fname = f"analysis_{product}.html"
+        html  = make_combined_html(days_data, product)
+        with open(fname, "w") as f:
+            f.write(html)
+        print(f"  → {fname}\n")
+
+    print("Done.")
+    print("  analysis_EMERALDS.html")
+    print("  analysis_TOMATOES.html")
 
 
 if __name__ == "__main__":
