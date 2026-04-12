@@ -866,6 +866,336 @@ def build_figure(d, product, day):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 5b. EMERALDS-SPECIFIC FIGURE  (no EMA / regime — pegged asset MM)
+#     4 panels: Price · Position · PnL · Spread Capture
+# ══════════════════════════════════════════════════════════════════════════════
+
+def build_figure_emeralds(d, day):
+    ts  = d["ts"]
+    pnl = d["pnl"]
+
+    fig = make_subplots(
+        rows=4, cols=1,
+        shared_xaxes=True,
+        row_heights=[0.45, 0.18, 0.22, 0.15],
+        vertical_spacing=0.025,
+    )
+
+    # ── Master hover aggregator ───────────────────────────────────────────────
+    cdata = np.column_stack([
+        d["mid"],
+        np.where(np.isnan(d["bp1"]), 0, d["bp1"]),
+        np.where(np.isnan(d["ap1"]), 0, d["ap1"]),
+        d["pos"].astype(float),
+        pnl,
+        d["rpnl"],
+        np.where(np.isnan(d["em_bid_dist"]), 0, d["em_bid_dist"]),
+        np.where(np.isnan(d["em_ask_dist"]), 0, d["em_ask_dist"]),
+    ])
+    fig.add_trace(go.Scatter(
+        x=ts.tolist(), y=d["mid"].tolist(),
+        mode="markers", marker=dict(opacity=0, size=1),
+        showlegend=False, name="__hover__",
+        customdata=cdata,
+        hovertemplate=(
+            "<b>t = %{x:.1f}s</b><br>"
+            "Mid: %{customdata[0]:.2f}  FV=10000<br>"
+            "Bid: %{customdata[1]:.2f}  ·  Ask: %{customdata[2]:.2f}<br>"
+            "Bid dist FV: %{customdata[6]:+.2f}<br>"
+            "Ask dist FV: %{customdata[7]:+.2f}<br>"
+            "Position: %{customdata[3]:.0f}<br>"
+            "Total PnL: %{customdata[4]:.0f}<br>"
+            "Realized PnL: %{customdata[5]:.0f}"
+            "<extra></extra>"
+        ),
+    ), row=1, col=1)
+
+    # ══════════════════════════════════
+    #  ROW 1: PRICE PANEL
+    # ══════════════════════════════════
+
+    # L2/L3 depth band
+    valid3 = ~(np.isnan(d["bp3"]) | np.isnan(d["ap3"]))
+    if valid3.any():
+        tv  = ts[valid3].tolist()
+        b3v = d["bp3"][valid3].tolist()
+        a3v = d["ap3"][valid3].tolist()
+        fig.add_trace(go.Scatter(
+            x=tv + tv[::-1], y=b3v + a3v[::-1],
+            fill="toself", fillcolor="rgba(148,163,184,0.05)",
+            line=dict(width=0), name="L2–L3 depth",
+            hoverinfo="skip",
+        ), row=1, col=1)
+
+    # FV reference line
+    fig.add_shape(type="line",
+                  x0=float(ts[0]), x1=float(ts[-1]),
+                  y0=EMERALD_FV, y1=EMERALD_FV,
+                  line=dict(color="#fbbf24", width=1.5, dash="dot"),
+                  row=1, col=1)
+    fig.add_annotation(x=float(ts[-1]), y=EMERALD_FV,
+                       text=" FV = 10,000",
+                       font=dict(size=8, color="#fbbf24"),
+                       showarrow=False, xanchor="left", row=1, col=1)
+
+    # Our quoted bid/ask — constant stepped lines (SKEW=0, so always 9992/10008)
+    for lvl, clr, nm in [
+        (EMERALD_FV - EMERALD_OFFSET, "#4ade80",
+         f"Our bid quote ({EMERALD_FV - EMERALD_OFFSET})"),
+        (EMERALD_FV + EMERALD_OFFSET, "#f87171",
+         f"Our ask quote ({EMERALD_FV + EMERALD_OFFSET})"),
+    ]:
+        fig.add_shape(type="line",
+                      x0=float(ts[0]), x1=float(ts[-1]),
+                      y0=lvl, y1=lvl,
+                      line=dict(color=clr, width=1.5, dash="dash"),
+                      row=1, col=1)
+        fig.add_annotation(x=float(ts[-1]), y=lvl, text=f" {nm}",
+                           font=dict(size=8, color=clr),
+                           showarrow=False, xanchor="left", row=1, col=1)
+
+    # Take-opportunity highlights
+    buy_spans = _build_spans(d["em_take_buy"].astype(int), ts)
+    for x0, x1, v in buy_spans:
+        if v == 1:
+            fig.add_vrect(x0=x0, x1=x1, fillcolor="rgba(74,222,128,0.22)",
+                          layer="above", line_width=0, row=1, col=1)
+    sell_spans = _build_spans(d["em_take_sell"].astype(int), ts)
+    for x0, x1, v in sell_spans:
+        if v == 1:
+            fig.add_vrect(x0=x0, x1=x1, fillcolor="rgba(248,113,113,0.22)",
+                          layer="above", line_width=0, row=1, col=1)
+
+    # Best bid / ask thin translucent
+    fig.add_trace(go.Scatter(
+        x=ts.tolist(), y=d["bp1"].tolist(), mode="lines",
+        line=dict(color="rgba(56,189,248,0.30)", width=1),
+        name="Best bid", hoverinfo="skip",
+    ), row=1, col=1)
+    fig.add_trace(go.Scatter(
+        x=ts.tolist(), y=d["ap1"].tolist(), mode="lines",
+        line=dict(color="rgba(248,113,113,0.30)", width=1),
+        name="Best ask", hoverinfo="skip",
+    ), row=1, col=1)
+
+    # Mid price — main focus
+    fig.add_trace(go.Scatter(
+        x=ts.tolist(), y=d["mid"].tolist(), mode="lines",
+        line=dict(color="#f8fafc", width=2.2),
+        name="Mid price", hoverinfo="skip",
+    ), row=1, col=1)
+
+    # Bucketed fill triangles at actual fill prices
+    bucketed = bucket_fills(d["fills"], window=5.0)
+    for bkts, sym, clr, nm in [
+        ([b for b in bucketed if b["net"] > 0], "triangle-up",   "#22c55e", "Buy (5s bucket)"),
+        ([b for b in bucketed if b["net"] < 0], "triangle-down", "#ef4444", "Sell (5s bucket)"),
+        ([b for b in bucketed if b["net"] == 0 and b["buys"] > 0],
+         "circle", "#94a3b8", "Mixed (5s bucket)"),
+    ]:
+        if not bkts:
+            continue
+        fig.add_trace(go.Scatter(
+            x=[b["ts"] for b in bkts],
+            y=[b["avg_price"] for b in bkts],
+            mode="markers",
+            marker=dict(symbol=sym, color=clr,
+                        size=[max(abs(b["net"]) * 1.8, 5) for b in bkts],
+                        opacity=0.70,
+                        line=dict(width=0.5, color="rgba(255,255,255,0.5)")),
+            name=nm,
+            hovertemplate=(
+                f"<b>{nm}</b><br>t=%{{x:.1f}}s  avg=%{{y:.2f}}<br>"
+                "net=%{customdata[0]}  buys=%{customdata[1]}  sells=%{customdata[2]}"
+                "<extra></extra>"
+            ),
+            customdata=[[b["net"], b["buys"], b["sells"]] for b in bkts],
+        ), row=1, col=1)
+
+    # Rug plot
+    if d["fills"]:
+        p_vals = d["bp1"][~np.isnan(d["bp1"])]
+        p_min  = float(p_vals.min()) if len(p_vals) else float(np.nanmin(d["mid"]))
+        p_max  = float(d["ap1"][~np.isnan(d["ap1"])].max()) if (~np.isnan(d["ap1"])).any() else float(np.nanmax(d["mid"]))
+        rug_y  = p_min - (p_max - p_min) * 0.012
+        rug_c  = ["#22c55e" if f["qty"] > 0 else "#ef4444" for f in d["fills"]]
+        fig.add_trace(go.Scatter(
+            x=[f["ts"] for f in d["fills"]], y=[rug_y] * len(d["fills"]),
+            mode="markers",
+            marker=dict(symbol="line-ns", size=8, color=rug_c,
+                        line=dict(width=1.2, color=rug_c)),
+            name="Fill rug", showlegend=False,
+            hovertemplate="Fill: qty=%{customdata[0]} @ %{customdata[1]}<extra></extra>",
+            customdata=[[abs(f["qty"]), f["price"]] for f in d["fills"]],
+        ), row=1, col=1)
+
+    # ══════════════════════════════════
+    #  ROW 2: POSITION  (+ inventory skew = pos/limit on secondary)
+    # ══════════════════════════════════
+
+    pos  = d["pos"].astype(float)
+    pmin = float(pos.min());  pmax = float(pos.max())
+    pad  = max((pmax - pmin) * 0.25, 5.0)
+    y_lo = max(pmin - pad, -POS_LIMIT - 10)
+    y_hi = min(pmax + pad,  POS_LIMIT + 10)
+
+    fig.add_trace(go.Scatter(
+        x=ts.tolist(), y=pos.tolist(), mode="lines",
+        line=dict(color="#38bdf8", width=1.5),
+        fill="tozeroy", fillcolor="rgba(56,189,248,0.10)",
+        name="Position",
+        hovertemplate="Position: %{y:.0f}<extra></extra>",
+    ), row=2, col=1)
+
+    # Inventory skew line: skew = -pos * SKEW. Since SKEW=0, always 0.
+    # Show as dotted zero line with label so viewer understands no skew is applied.
+    fig.add_shape(type="line",
+                  x0=float(ts[0]), x1=float(ts[-1]), y0=0, y1=0,
+                  line=dict(color="#64748b", width=0.8, dash="dot"),
+                  row=2, col=1)
+    fig.add_annotation(x=float(ts[0]), y=0,
+                       text="Skew=0 (EMERALD_SKEW=0)",
+                       font=dict(size=7, color="#64748b"),
+                       showarrow=False, xanchor="left", yanchor="bottom",
+                       row=2, col=1)
+
+    for lim, clr in [(POS_LIMIT, "#f87171"), (-POS_LIMIT, "#f87171")]:
+        fig.add_shape(type="line",
+                      x0=float(ts[0]), x1=float(ts[-1]), y0=lim, y1=lim,
+                      line=dict(color=clr, width=0.9, dash="dash"), row=2, col=1)
+        fig.add_annotation(x=float(ts[-1]), y=float(lim),
+                           text=f" {lim:+d} limit",
+                           font=dict(size=8, color=clr),
+                           showarrow=False, xanchor="left", yanchor="middle",
+                           row=2, col=1)
+
+    # ══════════════════════════════════
+    #  ROW 3: P&L  (same as TOMATOES)
+    # ══════════════════════════════════
+
+    running_max = np.maximum.accumulate(pnl)
+    pnl_lo = float(np.min(pnl))
+
+    fig.add_trace(go.Scatter(
+        x=ts.tolist(), y=running_max.tolist(),
+        mode="lines", line=dict(width=0),
+        showlegend=False, hoverinfo="skip", name="__dd_top__",
+    ), row=3, col=1)
+    fig.add_trace(go.Scatter(
+        x=ts.tolist(), y=pnl.tolist(),
+        fill="tonexty", fillcolor="rgba(239,68,68,0.13)",
+        mode="lines", line=dict(width=0),
+        showlegend=False, hoverinfo="skip", name="__dd_bot__",
+    ), row=3, col=1)
+    fig.add_trace(go.Scatter(
+        x=ts.tolist(), y=d["rpnl"].tolist(), mode="lines",
+        line=dict(color="#64748b", width=1.1, dash="dot"),
+        name="Realized PnL",
+        hovertemplate="Realized: %{y:.0f}<extra></extra>",
+    ), row=3, col=1)
+    fig.add_trace(go.Scatter(
+        x=ts.tolist(), y=pnl.tolist(), mode="lines",
+        line=dict(color="#4ade80", width=2.2),
+        name="Total PnL",
+        hovertemplate="Total PnL: %{y:.0f}<extra></extra>",
+    ), row=3, col=1)
+    fig.add_annotation(x=float(ts[-1]), y=float(pnl[-1]),
+                       text=f"  {d['final_pnl']:+,.0f}",
+                       font=dict(size=11, color="#4ade80", family="monospace"),
+                       showarrow=False, xanchor="left", row=3, col=1)
+
+    # Fill tick marks on PnL x-axis
+    if d["fills"]:
+        rug_pnl = pnl_lo - abs(pnl_lo) * 0.04 - 5
+        fig.add_trace(go.Scatter(
+            x=[f["ts"] for f in d["fills"]], y=[rug_pnl] * len(d["fills"]),
+            mode="markers",
+            marker=dict(symbol="line-ns-open", size=7,
+                        line=dict(width=1, color="rgba(148,163,184,0.45)")),
+            showlegend=False, hoverinfo="skip",
+        ), row=3, col=1)
+
+    # ══════════════════════════════════
+    #  ROW 4: SPREAD CAPTURE
+    #  Edge per fill = FV - fill_price (buy) or fill_price - FV (sell)
+    #  Passive fills: edge = OFFSET = 8 exactly
+    #  Taking fills: edge = distance the order crossed FV (> 8 possible)
+    # ══════════════════════════════════
+
+    if d["fills"]:
+        fill_ts    = [f["ts"] for f in d["fills"]]
+        fill_edges = [
+            (EMERALD_FV - f["price"]) if f["qty"] > 0
+            else (f["price"] - EMERALD_FV)
+            for f in d["fills"]
+        ]
+        edge_colors = ["#4ade80" if e >= 0 else "#ef4444" for e in fill_edges]
+        fig.add_trace(go.Bar(
+            x=fill_ts, y=fill_edges,
+            marker=dict(color=edge_colors, line=dict(width=0)),
+            name="Edge per fill",
+            hovertemplate=(
+                "Edge: %{y:+.2f} ticks<br>"
+                "t=%{x:.1f}s  fill_px=%{customdata}<extra></extra>"
+            ),
+            customdata=[f["price"] for f in d["fills"]],
+        ), row=4, col=1)
+
+        # Reference lines
+        fig.add_shape(type="line",
+                      x0=float(ts[0]), x1=float(ts[-1]),
+                      y0=EMERALD_OFFSET, y1=EMERALD_OFFSET,
+                      line=dict(color="#94a3b8", width=0.9, dash="dash"),
+                      row=4, col=1)
+        fig.add_annotation(x=float(ts[-1]), y=EMERALD_OFFSET,
+                           text=f" passive edge (+{EMERALD_OFFSET})",
+                           font=dict(size=8, color="#94a3b8"),
+                           showarrow=False, xanchor="left", row=4, col=1)
+        fig.add_shape(type="line",
+                      x0=float(ts[0]), x1=float(ts[-1]), y0=0, y1=0,
+                      line=dict(color="#ef4444", width=0.8, dash="dot"),
+                      row=4, col=1)
+
+    # ══════════════════════════════════
+    #  GLOBAL LAYOUT
+    # ══════════════════════════════════
+
+    fig.update_layout(
+        paper_bgcolor="#0f172a", plot_bgcolor="#1e293b",
+        font=dict(color="#cbd5e1", size=11, family="monospace"),
+        hovermode="x",
+        height=920,
+        title=dict(
+            text=f"<b>EMERALDS</b>  ·  Day {day:+d}  ·  Round 0",
+            font=dict(size=15, color="#f1f5f9"), x=0.5,
+        ),
+        legend=dict(
+            orientation="v", x=1.01, y=0.98,
+            bgcolor="rgba(15,23,42,0.9)",
+            bordercolor="#334155", borderwidth=1,
+            font=dict(size=9.5),
+        ),
+        margin=dict(l=70, r=210, t=55, b=50),
+        bargap=0.2,
+    )
+
+    spike_kw = dict(showspikes=True, spikemode="across", spikethickness=1,
+                    spikecolor="#64748b", spikedash="dot", spikesnap="cursor")
+    grid_kw  = dict(gridcolor="#1e3a5f", zerolinecolor="#334155")
+    for r in range(1, 5):
+        fig.update_xaxes(row=r, col=1, **spike_kw, **grid_kw)
+        fig.update_yaxes(row=r, col=1, **grid_kw)
+
+    fig.update_yaxes(title_text="Price",          row=1, col=1)
+    fig.update_yaxes(title_text="Position",       row=2, col=1, range=[y_lo, y_hi])
+    fig.update_yaxes(title_text="P&L",            row=3, col=1)
+    fig.update_yaxes(title_text="Edge (ticks)",   row=4, col=1)
+    fig.update_xaxes(title_text="Time (seconds into day)", row=4, col=1)
+
+    return fig
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 6.  HTML OUTPUT
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -912,6 +1242,54 @@ def _summary_html(d, product, day) -> str:
         f'<span style="color:#4ade80">Strong bull </span><b>{rt["strong_bullish"]:.0f}s ({rt["strong_bullish"]/ttot*100:.0f}%)</b>'
         f'</div>'
     )
+
+
+def make_single_html(fig, d, product: str, day: int) -> str:
+    """Single-day self-contained HTML file."""
+    import json as _json
+    summary = _summary_html(d, product, day)
+    fig_json = fig.to_json()
+    hint = "↓ Price · Position · P&amp;L"
+    if product == "TOMATOES":
+        hint += " · Signal (EMA diff + imbalance) · Algo action"
+    else:
+        hint += " · Spread Capture"
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>IMC P4 · {product} · Day {day:+d}</title>
+  <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+  <style>
+    *{{box-sizing:border-box;margin:0;padding:0;}}
+    body{{background:#0f172a;font-family:monospace;}}
+    .hdr{{background:#1e293b;border-bottom:1px solid #334155;
+          padding:14px 28px;display:flex;align-items:center;
+          justify-content:space-between;gap:20px;}}
+    .hdr h1{{font-size:1.05rem;color:#f1f5f9;}}
+    .hdr span{{font-size:0.8rem;color:#64748b;}}
+    #summary-box{{padding:12px 28px;}}
+    .hint{{text-align:center;font-size:0.75rem;color:#475569;padding:3px;}}
+    #chart-div{{width:100%;}}
+  </style>
+</head>
+<body>
+  <div class="hdr">
+    <h1>IMC Prosperity 4 · Round 0 · {product} · Day {day:+d}</h1>
+    <span>Hover → crosshair · Scroll = zoom · Drag = pan</span>
+  </div>
+  <div id="summary-box">{summary}</div>
+  <div class="hint">{hint}</div>
+  <div id="chart-div"></div>
+  <script>
+    const FIG    = {fig_json};
+    const CONFIG = {{scrollZoom:true,displaylogo:false,
+                    modeBarButtonsToRemove:["lasso2d","select2d"]}};
+    Plotly.newPlot("chart-div", FIG.data, FIG.layout, CONFIG);
+  </script>
+</body>
+</html>"""
 
 
 def make_combined_html(days_data: list, product: str) -> str:
@@ -1027,33 +1405,40 @@ def main():
     days = sorted({r["day"] for r in rows})
     print(f"Days found: {days}\n")
 
+    import traceback as _tb
+    written = []
+
     for product in ["EMERALDS", "TOMATOES"]:
-        days_data = []   # list of (day, d, fig)
         for day_idx, day in enumerate(days):
-            label = f"{product} Day {day:+d}"
-            print(f"  [{label}]  extracting…", end=" ", flush=True)
-            d = extract(rows, trades, product, day, day_idx)
-            if d is None:
-                print("no data — skipped.")
+            print(f"Processing {product} day {day}...")
+            try:
+                d = extract(rows, trades, product, day, day_idx)
+                if d is None:
+                    print(f"  extract() returned None — no rows for {product} day {day}")
+                    continue
+                print(f"  extract OK: fills={d['total_fills']}  PnL={d['final_pnl']:+,.0f}")
+
+                if product == "EMERALDS":
+                    fig = build_figure_emeralds(d, day)
+                else:
+                    fig = build_figure(d, product, day)
+                print(f"  build_figure OK")
+
+                fname = f"analysis_{product}_day{day}.html"
+                html  = make_single_html(fig, d, product, day)
+                with open(fname, "w") as f:
+                    f.write(html)
+                kb = os.path.getsize(fname) // 1024
+                print(f"  → wrote {fname}  ({kb} KB)")
+                written.append(fname)
+            except Exception:
+                print(f"  ERROR in {product} day {day}:")
+                _tb.print_exc()
                 continue
-            print(f"fills={d['total_fills']}  PnL={d['final_pnl']:+,.0f}",
-                  end="  building…", flush=True)
-            fig = build_figure(d, product, day)
-            days_data.append((day, d, fig))
-            print(" ✓")
 
-        if not days_data:
-            continue
-
-        fname = f"analysis_{product}.html"
-        html  = make_combined_html(days_data, product)
-        with open(fname, "w") as f:
-            f.write(html)
-        print(f"  → {fname}\n")
-
-    print("Done.")
-    print("  analysis_EMERALDS.html")
-    print("  analysis_TOMATOES.html")
+    print("\nDone. Files written:")
+    for fn in written:
+        print(f"  {fn}")
 
 
 if __name__ == "__main__":
