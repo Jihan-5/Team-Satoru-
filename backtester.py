@@ -102,8 +102,6 @@ class EmeraldTrader:
 
         # Stoikov reservation price skew (σ≈0, so shift is purely inventory-driven)
         skew = round(self.pos * EMERALD_SKEW)
-        bid_q = EMERALD_FV - EMERALD_OFFSET - skew   # e.g. 9993 when flat
-        ask_q = EMERALD_FV + EMERALD_OFFSET - skew   # e.g. 10007 when flat
 
         # ── 1. TAKING ─────────────────────────────────────────────────────────
         # Buy any ask that crosses below FV (never observed in normal conditions,
@@ -115,7 +113,7 @@ class EmeraldTrader:
                 # Strictly below FV: free money – take everything
                 self._buy(ap, av)
             elif ap == EMERALD_FV:
-                # At FV: only take if short (faster path to flat than waiting for 9993)
+                # At FV: only take if short (faster path to flat than waiting for passive)
                 if self.pos < 0:
                     self._buy(ap, min(av, abs(self.pos)))
 
@@ -130,7 +128,22 @@ class EmeraldTrader:
                 if self.pos > 0:
                     self._sell(bp, min(bv, self.pos))
 
-        # ── 2. MAKING ─────────────────────────────────────────────────────────
+        # ── 2. MAKING with queue priority ─────────────────────────────────────
+        # Jump to front of queue: post 1 tick inside best bid/ask, capped at
+        # profitable levels (bid must stay < FV, ask must stay > FV).
+        if self.bids and self.asks:
+            best_bid_price = max(self.bids.keys())
+            best_ask_price = min(self.asks.keys())
+            bid_q = min(best_bid_price + 1, EMERALD_FV - 1) - skew
+            ask_q = max(best_ask_price - 1, EMERALD_FV + 1) - skew
+            # Safety: never cross (can happen if spread is 1 tick)
+            if bid_q >= ask_q:
+                bid_q = EMERALD_FV - 1
+                ask_q = EMERALD_FV + 1
+        else:
+            bid_q = EMERALD_FV - EMERALD_OFFSET - skew
+            ask_q = EMERALD_FV + EMERALD_OFFSET - skew
+
         self._buy (bid_q, self.cap_buy)
         self._sell(ask_q, self.cap_sell)
 
@@ -279,20 +292,46 @@ class TomatoTrader:
                 and (fast_ema - slow_ema) < -TOMATO_MILD_THR)
         )
 
-        if self.bid_wall is not None and self.ask_wall is not None:
+        ema_diff = (fast_ema - slow_ema) if (fast_ema is not None and slow_ema is not None) else 0.0
+        strong_bull = n_ticks >= TOMATO_WARMUP and ema_diff >  TOMATO_STRONG_THR
+        strong_bear = n_ticks >= TOMATO_WARMUP and ema_diff < -TOMATO_STRONG_THR
+
+        # ── Aggressive taking in strong trend ─────────────────────────────────
+        if strong_bull:
+            # Strong uptrend: sweep asks aggressively (build long quickly)
+            for ap, av in self.asks.items():
+                if self.cap_buy <= 0:
+                    break
+                self._buy(ap, av)
+
+        if strong_bear:
+            # Strong downtrend: sweep bids aggressively (build short quickly)
+            for bp, bv in self.bids.items():
+                if self.cap_sell <= 0:
+                    break
+                self._sell(bp, bv)
+
+        # ── Passive making with queue priority ────────────────────────────────
+        if self.bid_wall is not None and self.ask_wall is not None and self.cap_buy + self.cap_sell > 0:
+            # Queue-priority prices: 1 tick inside best, never crossing spread
+            qp_bid = self.best_bid + 1 if (self.best_bid + 1 < self.best_ask) else self.best_bid
+            qp_ask = self.best_ask - 1 if (self.best_ask - 1 > self.best_bid) else self.best_ask
+
             if bearish:
-                # Downtrend: L2 bid (avoid over-buying dips) + L1 ask (sell bounces fast)
+                # Downtrend: use deeper bid level to avoid accumulating longs into the dip
                 self._post_bid(self.bid_wall + 1, self.cap_buy)
-                self._post_ask(self.best_ask,     self.cap_sell)
+                self._post_ask(qp_ask,            self.cap_sell)
             else:
-                # Neutral / bullish: symmetric L1 market making — maximum fill rate
-                self._post_bid(self.best_bid, self.cap_buy)
-                self._post_ask(self.best_ask, self.cap_sell)
+                # Neutral / bullish: queue-priority symmetric quoting
+                self._post_bid(qp_bid, self.cap_buy)
+                self._post_ask(qp_ask, self.cap_sell)
 
         self.prints[TOMATO] = {
             'POS': self.pos, 'BEAR': bearish,
+            'STR_BULL': strong_bull, 'STR_BEAR': strong_bear,
             'FAST': round(fast_ema, 2) if fast_ema else None,
             'SLOW': round(slow_ema, 2) if slow_ema else None,
+            'DIFF': round(ema_diff, 3),
             'N': n_ticks,
         }
         return {TOMATO: self.orders}
