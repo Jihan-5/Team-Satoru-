@@ -1,19 +1,16 @@
 """
-IMC Prosperity 4 — Multi-panel analysis dashboard
-Generates 4 self-contained HTML files:
-  analysis_EMERALDS_day-2.html
-  analysis_EMERALDS_day-1.html
-  analysis_TOMATOES_day-2.html
-  analysis_TOMATOES_day-1.html
+IMC Prosperity 4 — Multi-panel analysis dashboard (v2)
+Outputs 4 self-contained HTML files:
+  analysis_EMERALDS_day-2.html   analysis_EMERALDS_day-1.html
+  analysis_TOMATOES_day-2.html   analysis_TOMATOES_day-1.html
 
-Each file has 4 vertically-stacked panels with shared x-axis and
-synchronized crosshair hover:
-  1. Price  — mid + best bid/ask + L2/L3 bands + EMA fast/slow +
-               regime shading + fill triangles sized by volume
-  2. Position — filled area + ±limit lines + target position
-  3. PnL    — total + realized-only
-  4. Signal  — EMA diff (fast−slow) + regime thresholds +
-               L1 volume imbalance (secondary axis)
+5 vertically-stacked panels, shared x-axis, spike-crosshair on hover:
+  1. Price      — mid + best bid/ask + L2/L3 band + EMA fast/slow +
+                  regime shading + bucketed fill triangles + rug plot
+  2. Algo action — thin strip: gray=warmup, blue=neutral MM, red=bearish posting
+  3. Position   — filled area, auto-zoom y, ±limit annotations, target step line
+  4. P&L        — total (green) + realized (dotted) + drawdown shading + fill ticks
+  5. Signal     — EMA diff + ±STRONG/MILD threshold lines + L1 imbalance (2nd y)
 """
 
 import json, os, re, subprocess, sys, tempfile
@@ -22,23 +19,23 @@ import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-# ── Constants (mirror backtester.py) ─────────────────────────────────────────
-EMERALD_FV      = 10_000
-EMERALD_OFFSET  = 8
-POS_LIMIT       = 80
-EMA_FAST        = 9
-EMA_SLOW        = 16
-WARMUP          = 20
-MILD_THR        = 0.05
-STRONG_THR      = 3.5
+# ── Mirror backtester constants ───────────────────────────────────────────────
+EMERALD_FV     = 10_000
+EMERALD_OFFSET = 8
+POS_LIMIT      = 80
+EMA_FAST_N     = 9
+EMA_SLOW_N     = 16
+WARMUP_TICKS   = 20
+MILD_THR       = 0.05   # actual value in backtester.py — NOT 1.5
+STRONG_THR     = 3.5
 
 ALGO  = "backtester.py"
 ROUND = "0"
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 # 1.  DATA ACQUISITION
-# ═══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 
 def run_backtest() -> str:
     tmp = tempfile.mktemp(suffix=".log")
@@ -56,7 +53,6 @@ def parse_log(path: str):
     with open(path) as f:
         raw = f.read()
 
-    # ── Activities CSV ────────────────────────────────────────────────────────
     act_start = raw.index("Activities log:") + len("Activities log:")
     act_end   = raw.rfind("\n[")
     rows = []
@@ -83,19 +79,17 @@ def parse_log(path: str):
         except (ValueError, IndexError):
             continue
 
-    # ── Trade history ─────────────────────────────────────────────────────────
     trade_raw = raw[act_end:].strip()
     trade_raw = re.sub(r",(\s*[}\]])", r"\1", trade_raw)
     trades    = json.loads(trade_raw)
-
     return rows, trades
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 # 2.  SIGNAL COMPUTATION
-# ═══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 
-def compute_ema(arr: np.ndarray, n: int) -> np.ndarray:
+def ema(arr: np.ndarray, n: int) -> np.ndarray:
     a   = 2.0 / (n + 1)
     out = np.empty_like(arr)
     out[0] = arr[0]
@@ -104,102 +98,104 @@ def compute_ema(arr: np.ndarray, n: int) -> np.ndarray:
     return out
 
 
-def regime_array(mid: np.ndarray, fast: np.ndarray, slow: np.ndarray
-                 ) -> np.ndarray:
+def regime_array(mid: np.ndarray, fast: np.ndarray, slow: np.ndarray) -> np.ndarray:
     """
-    Returns int array:
-      0 = neutral (|diff| < MILD_THR and no momentum)
-      1 = mild bearish  (momentum only, OR -STRONG_THR ≤ diff < -MILD_THR after warmup)
-      2 = strong bearish (diff < -STRONG_THR after warmup)
-      3 = mild bullish  (diff > MILD_THR after warmup)
-      4 = strong bullish (diff > STRONG_THR after warmup)
+    0 = neutral      |diff| < MILD_THR and no momentum
+    1 = mild bearish  momentum-only or -STRONG ≤ diff < -MILD after warmup
+    2 = strong bearish diff < -STRONG after warmup
+    3 = mild bullish  diff > MILD after warmup
+    4 = strong bullish diff > STRONG after warmup
     """
     n    = len(mid)
     diff = fast - slow
     mom  = np.zeros(n, bool)
     mom[1:] = mid[1:] < mid[:-1]
-    warm = np.arange(n) >= WARMUP
+    warm = np.arange(n) >= WARMUP_TICKS
 
-    regime = np.zeros(n, int)
-    # Bullish
-    regime[warm & (diff > MILD_THR)]   = 3
-    regime[warm & (diff > STRONG_THR)] = 4
-    # Bearish (overrides bullish at same tick — shouldn't conflict)
-    regime[mom & ~(warm & (diff > MILD_THR))] = 1          # momentum only
-    regime[warm & (diff < -MILD_THR)]  = 1                  # mild bearish
-    regime[warm & (diff < -STRONG_THR)] = 2                 # strong bearish
-    return regime
+    r = np.zeros(n, int)
+    r[warm & (diff >  MILD_THR)]   = 3
+    r[warm & (diff >  STRONG_THR)] = 4
+    r[mom  & ~(warm & (diff > MILD_THR))] = 1
+    r[warm & (diff < -MILD_THR)]   = 1
+    r[warm & (diff < -STRONG_THR)] = 2
+    return r
 
 
-def fifo_realized(fills_sorted: list) -> list:
-    """
-    FIFO realized P&L.  fills_sorted: list of dicts with 'qty' (signed) and 'price'.
-    Returns list of cumulative realized P&L values (same length as input).
-    """
-    longs  = deque()   # (qty, price)
-    shorts = deque()
-    realized = 0.0
-    cum = []
-    for f in fills_sorted:
+def fifo_realized(fills: list) -> list:
+    longs, shorts = deque(), deque()
+    realized, cum = 0.0, []
+    for f in fills:
         qty, price = f["qty"], f["price"]
-        if qty > 0:                     # buy: close shorts first
+        if qty > 0:
             rem = qty
             while rem > 0 and shorts:
                 sq, sp = shorts[0]
-                m = min(sq, rem)
-                realized += m * (sp - price)
-                rem -= m; sq -= m
+                m = min(sq, rem);  realized += m * (sp - price)
+                rem -= m;  sq -= m
                 if sq == 0: shorts.popleft()
                 else:       shorts[0] = (sq, sp)
-            if rem > 0:
-                longs.append((rem, price))
-        else:                           # sell: close longs first
+            if rem > 0: longs.append((rem, price))
+        else:
             rem = -qty
             while rem > 0 and longs:
                 lq, lp = longs[0]
-                m = min(lq, rem)
-                realized += m * (price - lp)
-                rem -= m; lq -= m
+                m = min(lq, rem);  realized += m * (price - lp)
+                rem -= m;  lq -= m
                 if lq == 0: longs.popleft()
                 else:       longs[0] = (lq, lp)
-            if rem > 0:
-                shorts.append((rem, price))
+            if rem > 0: shorts.append((rem, price))
         cum.append(realized)
     return cum
 
 
-def position_from_fills(fills_sorted: list, tick_ts: np.ndarray) -> np.ndarray:
-    """
-    Forward-fill position from fills into a tick-resolution array.
-    """
-    pos = 0
-    pos_arr = np.zeros(len(tick_ts), int)
-    fi = 0
+def pos_from_fills(fills: list, tick_ts: np.ndarray) -> np.ndarray:
+    pos, arr, fi = 0, np.zeros(len(tick_ts), int), 0
     for i, t in enumerate(tick_ts):
-        while fi < len(fills_sorted) and fills_sorted[fi]["ts"] <= t:
-            pos += fills_sorted[fi]["qty"]
-            fi  += 1
-        pos_arr[i] = pos
-    return pos_arr
+        while fi < len(fills) and fills[fi]["ts"] <= t:
+            pos += fills[fi]["qty"];  fi += 1
+        arr[i] = pos
+    return arr
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# 3.  PER-PRODUCT / PER-DAY DATA EXTRACTION
-# ═══════════════════════════════════════════════════════════════════════════════
+def bucket_fills(fills: list, window: float = 5.0) -> list:
+    """Group fills into window-second buckets."""
+    if not fills:
+        return []
+    buckets: dict = {}
+    for f in fills:
+        b = int(f["ts"] / window)
+        if b not in buckets:
+            buckets[b] = {"ts": (b + 0.5) * window, "net": 0,
+                          "buys": 0, "sells": 0, "prices": []}
+        buckets[b]["net"]    += f["qty"]
+        buckets[b]["prices"].append(f["price"])
+        if f["qty"] > 0: buckets[b]["buys"]  += f["qty"]
+        else:            buckets[b]["sells"] += abs(f["qty"])
+    result = []
+    for b in sorted(buckets):
+        bk = buckets[b]
+        bk["avg_price"] = float(np.mean(bk["prices"]))
+        result.append(bk)
+    return result
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 3.  PER-DAY DATA EXTRACTION
+# ══════════════════════════════════════════════════════════════════════════════
 
 def extract(rows, trades, product, day, day_idx):
-    book = [r for r in rows if r["product"] == product and r["day"] == day]
-    book.sort(key=lambda r: r["ts"])
+    book = sorted(
+        [r for r in rows if r["product"] == product and r["day"] == day],
+        key=lambda r: r["ts"],
+    )
     if not book:
         return None
 
-    # x-axis: seconds from start of day
     t0  = book[0]["ts"]
     ts  = np.array([(r["ts"] - t0) / 1000.0 for r in book])
 
-    # Price levels
-    def col(key): return np.array(
-        [r[key] if r[key] is not None else np.nan for r in book])
+    def col(k): return np.array(
+        [r[k] if r[k] is not None else np.nan for r in book])
 
     mid  = col("mid")
     bp1, bv1 = col("bp1"), col("bv1")
@@ -209,392 +205,486 @@ def extract(rows, trades, product, day, day_idx):
     ap2, av2 = col("ap2"), col("av2")
     ap3, av3 = col("ap3"), col("av3")
 
-    # Fill NaN mid with linear interp before EMA
     nans = np.isnan(mid)
     if nans.any() and (~nans).any():
         mid[nans] = np.interp(np.flatnonzero(nans),
                               np.flatnonzero(~nans), mid[~nans])
 
-    # PnL: normalize to start at 0 each day
     pnl_raw = np.array([r["pnl"] for r in book])
     pnl     = pnl_raw - pnl_raw[0]
 
-    # EMAs and regime (computed locally — no lambda-log dependency)
-    fast = compute_ema(mid, EMA_FAST)
-    slow = compute_ema(mid, EMA_SLOW)
-    diff = fast - slow
-    reg  = regime_array(mid, fast, slow)
+    fast_arr = ema(mid, EMA_FAST_N)
+    slow_arr = ema(mid, EMA_SLOW_N)
+    diff_arr = fast_arr - slow_arr
+    reg      = regime_array(mid, fast_arr, slow_arr)
 
-    # L1 volume imbalance
     with np.errstate(divide="ignore", invalid="ignore"):
-        imbalance = np.where(
-            (bv1 > 0) & (av1 > 0),
-            (bv1 - av1) / (bv1 + av1),
-            0.0,
-        )
+        imbalance = np.where((bv1 > 0) & (av1 > 0),
+                             (bv1 - av1) / (bv1 + av1), 0.0)
 
-    # Fills — use global timestamps, subtract day_offset for local seconds
+    # Fills
     day_offset_ms = day_idx * 1_000_000
     fills_raw = []
     for t in trades:
         if t["symbol"] != product:
             continue
-        local_ms = t["timestamp"] - day_offset_ms
-        if not (0 <= local_ms < 1_000_000):
+        lms = t["timestamp"] - day_offset_ms
+        if not (0 <= lms < 1_000_000):
             continue
         is_buy  = t.get("buyer")  == "SUBMISSION"
         is_sell = t.get("seller") == "SUBMISSION"
         if not (is_buy or is_sell):
             continue
         fills_raw.append({
-            "ts":    local_ms / 1000.0,
+            "ts":    lms / 1000.0,
             "price": float(t["price"]),
             "qty":   int(t["quantity"]) * (1 if is_buy else -1),
         })
     fills_raw.sort(key=lambda f: f["ts"])
 
-    # Realized PnL (FIFO)
     rpnl_vals = fifo_realized(fills_raw)
     rpnl_ts   = [f["ts"] for f in fills_raw]
-    # Forward-fill to tick resolution
-    rpnl_tick = np.interp(ts, rpnl_ts if rpnl_ts else [0], rpnl_vals if rpnl_vals else [0])
+    rpnl_tick = (np.interp(ts, rpnl_ts, rpnl_vals)
+                 if rpnl_ts else np.zeros(len(ts)))
 
-    # Position at tick resolution
-    pos_tick  = position_from_fills(fills_raw, ts)
+    pos_tick  = pos_from_fills(fills_raw, ts)
 
-    # Target position (TOMATOES regime-based, EMERALDS = 0)
+    # Algo action: 0=warmup/idle, 1=neutral posting, 2=bearish posting
     if product == "TOMATOES":
-        # Bearish → short bias (strategy posts deep bid, rarely fills → net short)
-        # Not a hard target but indicative: neutral → 0, bearish → negative
-        target = np.where(reg >= 1, -POS_LIMIT * 0.5, 0).astype(float)
+        action = np.ones(len(ts), int)
+        action[:WARMUP_TICKS] = 0
+        action[(np.arange(len(ts)) >= WARMUP_TICKS) & (reg >= 1)] = 2
+    else:  # EMERALDS
+        action = np.ones(len(ts), int)
+        action[np.abs(pos_tick) > int(POS_LIMIT * 0.75)] = 2   # near limit → taking mode
+
+    # Target position
+    if product == "TOMATOES":
+        target = np.where(reg >= 1, float(-POS_LIMIT * 0.5), 0.0)
     else:
         target = np.zeros(len(ts))
 
     # Summary stats
-    total_fills  = sum(1 for f in fills_raw)
-    total_volume = sum(abs(f["qty"]) for f in fills_raw)
-    final_pnl    = pnl[-1] if len(pnl) else 0
-    drawdown     = np.max(np.maximum.accumulate(pnl) - pnl) if len(pnl) else 0
-    tick_count   = len(ts)
-    regime_time  = {
-        "neutral":        int(np.sum(reg == 0)) * 100 / 1000,
-        "mild_bearish":   int(np.sum(reg == 1)) * 100 / 1000,
-        "strong_bearish": int(np.sum(reg == 2)) * 100 / 1000,
-        "mild_bullish":   int(np.sum(reg == 3)) * 100 / 1000,
-        "strong_bullish": int(np.sum(reg == 4)) * 100 / 1000,
+    dd = float(np.max(np.maximum.accumulate(pnl) - pnl)) if len(pnl) else 0.0
+    tick_ms = 100
+    rt = {
+        "neutral":        int(np.sum(reg == 0)) * tick_ms / 1000,
+        "mild_bearish":   int(np.sum(reg == 1)) * tick_ms / 1000,
+        "strong_bearish": int(np.sum(reg == 2)) * tick_ms / 1000,
+        "mild_bullish":   int(np.sum(reg == 3)) * tick_ms / 1000,
+        "strong_bullish": int(np.sum(reg == 4)) * tick_ms / 1000,
     }
 
     return dict(
         ts=ts, mid=mid, pnl=pnl, rpnl=rpnl_tick,
         bp1=bp1, bv1=bv1, bp2=bp2, bv2=bv2, bp3=bp3, bv3=bv3,
         ap1=ap1, av1=av1, ap2=ap2, av2=av2, ap3=ap3, av3=av3,
-        fast=fast, slow=slow, diff=diff, reg=reg, imbalance=imbalance,
-        pos=pos_tick, target=target,
+        fast=fast_arr, slow=slow_arr, diff=diff_arr,
+        reg=reg, imbalance=imbalance,
+        pos=pos_tick, target=target, action=action,
         fills=fills_raw,
-        # summary
-        total_fills=total_fills, total_volume=total_volume,
-        final_pnl=final_pnl, drawdown=drawdown, regime_time=regime_time,
+        total_fills=len(fills_raw),
+        total_volume=sum(abs(f["qty"]) for f in fills_raw),
+        final_pnl=float(pnl[-1]) if len(pnl) else 0.0,
+        drawdown=dd,
+        regime_time=rt,
     )
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# 4.  CHART CONSTRUCTION
-# ═══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# 4.  CHART HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
 
-REGIME_COLORS = {
-    0: None,
-    1: "rgba(239,68,68,0.06)",    # mild bearish — faint red
-    2: "rgba(220,38,38,0.13)",    # strong bearish — red
-    3: "rgba(34,197,94,0.06)",    # mild bullish — faint green
-    4: "rgba(21,128,62,0.11)",    # strong bullish — green
+REGIME_BG = {
+    1: "rgba(239,68,68,0.07)",
+    2: "rgba(185,28,28,0.12)",
+    3: "rgba(34,197,94,0.07)",
+    4: "rgba(21,128,62,0.12)",
 }
-REGIME_LABELS = {
-    0: "Neutral",
-    1: "Mild bearish",
-    2: "Strong bearish",
-    3: "Mild bullish",
-    4: "Strong bullish",
+ACTION_COLORS = {
+    0: "rgba(100,116,139,0.55)",   # gray — warmup/idle
+    1: "rgba(56,189,248,0.45)",    # sky blue — neutral posting
+    2: "rgba(249,115,22,0.55)",    # orange — bearish posting
+}
+ACTION_LABELS = {
+    0: "Warmup / idle",
+    1: "Passive MM — neutral (L1/L1)",
+    2: "Passive MM — bearish (deep bid + L1 ask)",
 }
 
 
-def add_regime_shading(fig, ts, reg, row, col=1):
-    """Add background shading spans for each regime change."""
-    if len(reg) == 0:
-        return
-    spans = []
-    start, cur = ts[0], reg[0]
-    for t, r in zip(ts[1:], reg[1:]):
-        if r != cur:
-            spans.append((start, t, cur))
-            start, cur = t, r
-    spans.append((start, ts[-1], cur))
-    # Merge tiny spans (< 1s) into neighbours to avoid thousands of rects
+def _build_spans(arr, ts):
+    """Return list of (x0, x1, value) contiguous spans, merging spans < 1s."""
+    if len(arr) == 0:
+        return []
+    spans, start, cur = [], float(ts[0]), arr[0]
+    for t, v in zip(ts[1:], arr[1:]):
+        if v != cur:
+            spans.append([float(start), float(t), int(cur)])
+            start, cur = float(t), v
+    spans.append([float(start), float(ts[-1]), int(cur)])
+    # Merge tiny adjacent same-value spans
     merged = []
-    for span in spans:
-        if merged and span[2] == merged[-1][2]:
-            merged[-1] = (merged[-1][0], span[1], span[2])
-        elif span[1] - span[0] < 1.0 and merged:
-            # absorb into previous
-            merged[-1] = (merged[-1][0], span[1], merged[-1][2])
+    for s in spans:
+        if merged and s[2] == merged[-1][2]:
+            merged[-1][1] = s[1]
+        elif s[1] - s[0] < 1.0 and merged:
+            merged[-1][1] = s[1]   # absorb into previous
         else:
-            merged.append(list(span))
-    for x0, x1, r in merged:
-        color = REGIME_COLORS.get(r)
-        if color:
-            fig.add_vrect(x0=x0, x1=x1, fillcolor=color,
-                          layer="below", line_width=0,
-                          row=row, col=col)
+            merged.append(s)
+    return merged
 
+
+def add_vrects_from_spans(fig, spans, color_map, row, opacity_override=None):
+    for x0, x1, val in spans:
+        color = color_map.get(val)
+        if not color:
+            continue
+        if opacity_override is not None:
+            # Replace rgba alpha
+            import re as _re
+            color = _re.sub(r"(rgba\(\d+,\d+,\d+,)([\d.]+)(\))",
+                            lambda m: f"{m.group(1)}{opacity_override}{m.group(3)}",
+                            color)
+        fig.add_vrect(x0=x0, x1=x1, fillcolor=color,
+                      layer="below", line_width=0, row=row, col=1)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 5.  FIGURE CONSTRUCTION
+# ══════════════════════════════════════════════════════════════════════════════
 
 def build_figure(d, product, day):
-    """
-    d: dict from extract()
-    Returns a Plotly figure with 4 stacked panels.
-    """
-    ts   = d["ts"]
-    ts_s = [f"{t:.1f}s" for t in ts]   # string labels for hover
+    ts  = d["ts"]
+    pnl = d["pnl"]
 
+    # ── Layout ────────────────────────────────────────────────────────────────
     fig = make_subplots(
-        rows=4, cols=1,
+        rows=5, cols=1,
         shared_xaxes=True,
-        row_heights=[0.45, 0.18, 0.22, 0.15],
-        vertical_spacing=0.025,
+        row_heights=[0.42, 0.04, 0.17, 0.22, 0.15],
+        vertical_spacing=0.012,
         specs=[
-            [{"secondary_y": False}],
-            [{"secondary_y": False}],
-            [{"secondary_y": False}],
-            [{"secondary_y": True}],
+            [{"secondary_y": False}],  # 1. price
+            [{"secondary_y": False}],  # 2. algo action strip
+            [{"secondary_y": False}],  # 3. position
+            [{"secondary_y": False}],  # 4. pnl
+            [{"secondary_y": True}],   # 5. signal + imbalance
         ],
     )
 
-    # ── Build a flat customdata array for the unified hover tooltip ───────────
-    # Fields: [mid, bp1, ap1, fast, slow, diff, regime_label, pos, pnl, rpnl]
-    def safe(arr, i):
-        v = arr[i] if i < len(arr) else np.nan
-        return float(v) if v is not None and not np.isnan(float(v)) else 0.0
+    # ── Master hover aggregator (invisible, on price panel) ───────────────────
+    cdata = np.column_stack([
+        d["mid"],
+        np.where(np.isnan(d["bp1"]), 0, d["bp1"]),
+        np.where(np.isnan(d["ap1"]), 0, d["ap1"]),
+        d["fast"],
+        d["slow"],
+        d["diff"],
+        d["pos"].astype(float),
+        pnl,
+        d["rpnl"],
+    ])
+    REG_LABEL = ["Neutral","Mild bear","Strong bear","Mild bull","Strong bull"]
+    reg_labels = [REG_LABEL[r] for r in d["reg"]]
 
-    cdata = []
-    for i in range(len(ts)):
-        cdata.append([
-            safe(d["mid"],  i),
-            safe(d["bp1"],  i),
-            safe(d["ap1"],  i),
-            safe(d["fast"], i),
-            safe(d["slow"], i),
-            safe(d["diff"], i),
-            REGIME_LABELS.get(int(d["reg"][i]), "?"),
-            int(d["pos"][i]),
-            safe(d["pnl"],  i),
-            safe(d["rpnl"], i),
-        ])
-
-    HOVER = (
-        "<b>t=%{x:.1f}s</b><br>"
+    MASTER_HOVER = (
+        "<b>t = %{x:.1f}s</b><br>"
         "Mid: %{customdata[0]:.2f}<br>"
-        "Bid: %{customdata[1]:.2f}  Ask: %{customdata[2]:.2f}<br>"
-        "EMA fast: %{customdata[3]:.3f}<br>"
-        "EMA slow: %{customdata[4]:.3f}<br>"
-        "EMA diff: %{customdata[5]:.3f}<br>"
-        "Regime: %{customdata[6]}<br>"
-        "Position: %{customdata[7]}<br>"
-        "Total PnL: %{customdata[8]:.0f}<br>"
-        "Realized PnL: %{customdata[9]:.0f}"
+        "Bid: %{customdata[1]:.2f}  ·  Ask: %{customdata[2]:.2f}<br>"
+        "EMA fast: %{customdata[3]:.4f}<br>"
+        "EMA slow: %{customdata[4]:.4f}<br>"
+        "EMA diff: %{customdata[5]:.4f}<br>"
+        "Position: %{customdata[6]:.0f}<br>"
+        "Total PnL: %{customdata[7]:.0f}<br>"
+        "Realized PnL: %{customdata[8]:.0f}"
         "<extra></extra>"
     )
-
-    # ── Panel 1: PRICE ────────────────────────────────────────────────────────
-    add_regime_shading(fig, ts, d["reg"], row=1)
-
-    # L2/L3 depth band (very faint)
-    valid = ~(np.isnan(d["bp3"]) | np.isnan(d["ap3"]))
-    if valid.any():
-        ts_v   = ts[valid].tolist()
-        bid3_v = d["bp3"][valid].tolist()
-        ask3_v = d["ap3"][valid].tolist()
-        fig.add_trace(go.Scatter(
-            x=ts_v + ts_v[::-1],
-            y=bid3_v + ask3_v[::-1],
-            fill="toself",
-            fillcolor="rgba(148,163,184,0.07)",
-            line=dict(width=0),
-            name="L2-L3 depth band",
-            legendgroup="depth",
-            showlegend=True,
-            hoverinfo="skip",
-        ), row=1, col=1)
-
-    # Best bid / ask thin lines
-    fig.add_trace(go.Scatter(
-        x=ts.tolist(), y=d["bp1"].tolist(),
-        mode="lines",
-        line=dict(color="rgba(37,99,235,0.35)", width=1),
-        name="Best bid",
-        legendgroup="bestbid",
-        hovertemplate="Bid: %{y:.2f}<extra></extra>",
-    ), row=1, col=1)
-    fig.add_trace(go.Scatter(
-        x=ts.tolist(), y=d["ap1"].tolist(),
-        mode="lines",
-        line=dict(color="rgba(220,38,38,0.35)", width=1),
-        name="Best ask",
-        legendgroup="bestask",
-        hovertemplate="Ask: %{y:.2f}<extra></extra>",
-    ), row=1, col=1)
-
-    # EMA lines
-    fig.add_trace(go.Scatter(
-        x=ts.tolist(), y=d["fast"].tolist(),
-        mode="lines",
-        line=dict(color="#f59e0b", width=1.5, dash="solid"),
-        name=f"EMA fast ({EMA_FAST})",
-        hovertemplate=f"EMA{EMA_FAST}: %{{y:.3f}}<extra></extra>",
-    ), row=1, col=1)
-    fig.add_trace(go.Scatter(
-        x=ts.tolist(), y=d["slow"].tolist(),
-        mode="lines",
-        line=dict(color="#8b5cf6", width=1.5, dash="solid"),
-        name=f"EMA slow ({EMA_SLOW})",
-        hovertemplate=f"EMA{EMA_SLOW}: %{{y:.3f}}<extra></extra>",
-    ), row=1, col=1)
-
-    # Mid price — main focus
     fig.add_trace(go.Scatter(
         x=ts.tolist(), y=d["mid"].tolist(),
-        mode="lines",
-        line=dict(color="#1e293b", width=2),
-        name="Mid price",
+        mode="markers",
+        marker=dict(opacity=0, size=1),
+        showlegend=False,
+        name="__hover__",
         customdata=cdata,
-        hovertemplate=HOVER,
+        hovertemplate=MASTER_HOVER,
     ), row=1, col=1)
 
-    # Fill triangles (sized by |qty|, min size 6)
-    buys  = [f for f in d["fills"] if f["qty"] > 0]
-    sells = [f for f in d["fills"] if f["qty"] < 0]
+    # ══════════════════════════════════
+    #  ROW 1: PRICE PANEL
+    # ══════════════════════════════════
 
-    if buys:
-        # Place triangles at mid price interpolated to fill timestamp
-        buy_mid = np.interp([f["ts"] for f in buys], ts, d["mid"])
+    # Regime background shading
+    reg_spans = _build_spans(d["reg"], ts)
+    add_vrects_from_spans(fig, reg_spans, REGIME_BG, row=1)
+
+    # L2/L3 depth band (very faint fill)
+    valid3 = ~(np.isnan(d["bp3"]) | np.isnan(d["ap3"]))
+    if valid3.any():
+        tv = ts[valid3].tolist()
+        b3v = d["bp3"][valid3].tolist()
+        a3v = d["ap3"][valid3].tolist()
         fig.add_trace(go.Scatter(
-            x=[f["ts"] for f in buys],
-            y=buy_mid.tolist(),
-            mode="markers",
-            marker=dict(
-                symbol="triangle-up",
-                color="#16a34a",
-                size=[max(abs(f["qty"]) * 2.5, 6) for f in buys],
-                line=dict(width=0.5, color="white"),
-            ),
-            name="Buy fills",
-            hovertemplate=(
-                "<b>BUY</b><br>"
-                "t=%{x:.1f}s  price=%{customdata[0]}<br>"
-                "qty=%{customdata[1]}<extra></extra>"
-            ),
-            customdata=[[f["price"], abs(f["qty"])] for f in buys],
+            x=tv + tv[::-1], y=b3v + a3v[::-1],
+            fill="toself", fillcolor="rgba(148,163,184,0.06)",
+            line=dict(width=0),
+            name="L2–L3 depth", legendgroup="depth",
+            hoverinfo="skip",
         ), row=1, col=1)
 
-    if sells:
-        sell_mid = np.interp([f["ts"] for f in sells], ts, d["mid"])
-        fig.add_trace(go.Scatter(
-            x=[f["ts"] for f in sells],
-            y=sell_mid.tolist(),
-            mode="markers",
-            marker=dict(
-                symbol="triangle-down",
-                color="#dc2626",
-                size=[max(abs(f["qty"]) * 2.5, 6) for f in sells],
-                line=dict(width=0.5, color="white"),
-            ),
-            name="Sell fills",
-            hovertemplate=(
-                "<b>SELL</b><br>"
-                "t=%{x:.1f}s  price=%{customdata[0]}<br>"
-                "qty=%{customdata[1]}<extra></extra>"
-            ),
-            customdata=[[f["price"], abs(f["qty"])] for f in sells],
-        ), row=1, col=1)
-
-    # ── Panel 2: POSITION ─────────────────────────────────────────────────────
-    pos = d["pos"].astype(float).tolist()
+    # Best bid / ask — thin, translucent
     fig.add_trace(go.Scatter(
-        x=ts.tolist(), y=pos,
-        mode="lines",
-        line=dict(color="#0ea5e9", width=1.5),
-        fill="tozeroy",
-        fillcolor="rgba(14,165,233,0.12)",
-        name="Position",
-        customdata=cdata,
-        hovertemplate="Position: %{y}<br>PnL: %{customdata[8]:.0f}<extra></extra>",
+        x=ts.tolist(), y=d["bp1"].tolist(), mode="lines",
+        line=dict(color="rgba(56,189,248,0.30)", width=1),
+        name="Best bid", hoverinfo="skip",
+    ), row=1, col=1)
+    fig.add_trace(go.Scatter(
+        x=ts.tolist(), y=d["ap1"].tolist(), mode="lines",
+        line=dict(color="rgba(248,113,113,0.30)", width=1),
+        name="Best ask", hoverinfo="skip",
+    ), row=1, col=1)
+
+    # EMA fast — bright yellow, prominent
+    fig.add_trace(go.Scatter(
+        x=ts.tolist(), y=d["fast"].tolist(), mode="lines",
+        line=dict(color="#facc15", width=2.5),
+        name=f"EMA {EMA_FAST_N} (fast)",
+        hovertemplate=f"EMA{EMA_FAST_N}: %{{y:.3f}}<extra></extra>",
+    ), row=1, col=1)
+    # EMA slow — bright purple, prominent
+    fig.add_trace(go.Scatter(
+        x=ts.tolist(), y=d["slow"].tolist(), mode="lines",
+        line=dict(color="#c084fc", width=2.5),
+        name=f"EMA {EMA_SLOW_N} (slow)",
+        hovertemplate=f"EMA{EMA_SLOW_N}: %{{y:.3f}}<extra></extra>",
+    ), row=1, col=1)
+
+    # Mid price — main focus, thick dark line
+    fig.add_trace(go.Scatter(
+        x=ts.tolist(), y=d["mid"].tolist(), mode="lines",
+        line=dict(color="#f8fafc", width=2.2),
+        name="Mid price",
+        hoverinfo="skip",
+    ), row=1, col=1)
+
+    # Bucketed fill triangles (5-second windows), placed at actual fill price
+    bucketed = bucket_fills(d["fills"], window=5.0)
+    buy_bkts  = [b for b in bucketed if b["net"] > 0]
+    sell_bkts = [b for b in bucketed if b["net"] < 0]
+    mix_bkts  = [b for b in bucketed if b["net"] == 0 and b["buys"] > 0]
+
+    for bkts, sym, clr, nm in [
+        (buy_bkts,  "triangle-up",   "#22c55e", "Buy (5s bucket)"),
+        (sell_bkts, "triangle-down", "#ef4444", "Sell (5s bucket)"),
+        (mix_bkts,  "circle",        "#94a3b8", "Mixed (5s bucket)"),
+    ]:
+        if not bkts:
+            continue
+        fig.add_trace(go.Scatter(
+            x=[b["ts"] for b in bkts],
+            y=[b["avg_price"] for b in bkts],
+            mode="markers",
+            marker=dict(
+                symbol=sym, color=clr,
+                size=[max(abs(b["net"]) * 1.8, 5) for b in bkts],
+                opacity=0.70,
+                line=dict(width=0.5, color="rgba(255,255,255,0.5)"),
+            ),
+            name=nm,
+            hovertemplate=(
+                f"<b>{nm}</b><br>"
+                "t=%{x:.1f}s  avg_px=%{y:.2f}<br>"
+                "net=%{customdata[0]}  buys=%{customdata[1]}  sells=%{customdata[2]}"
+                "<extra></extra>"
+            ),
+            customdata=[[b["net"], b["buys"], b["sells"]] for b in bkts],
+        ), row=1, col=1)
+
+    # Rug plot — individual fill marks along the bottom of the price panel
+    if d["fills"]:
+        p_min = float(np.nanmin(d["bp3"][~np.isnan(d["bp3"])])) if (~np.isnan(d["bp3"])).any() else float(np.nanmin(d["mid"]))
+        p_max = float(np.nanmax(d["ap3"][~np.isnan(d["ap3"])])) if (~np.isnan(d["ap3"])).any() else float(np.nanmax(d["mid"]))
+        rug_y = p_min - (p_max - p_min) * 0.012
+        rug_cols = ["#22c55e" if f["qty"] > 0 else "#ef4444" for f in d["fills"]]
+        fig.add_trace(go.Scatter(
+            x=[f["ts"] for f in d["fills"]],
+            y=[rug_y] * len(d["fills"]),
+            mode="markers",
+            marker=dict(symbol="line-ns", size=8,
+                        color=rug_cols,
+                        line=dict(width=1.2, color=rug_cols)),
+            name="Fill rug",
+            showlegend=False,
+            hovertemplate="Fill: qty=%{customdata[0]} @ %{customdata[1]}<extra></extra>",
+            customdata=[[abs(f["qty"]), f["price"]] for f in d["fills"]],
+        ), row=1, col=1)
+
+    # ══════════════════════════════════
+    #  ROW 2: ALGO ACTION STRIP
+    # ══════════════════════════════════
+
+    # Invisible anchor trace so the subplot axis exists
+    fig.add_trace(go.Scatter(
+        x=[ts[0], ts[-1]], y=[0.5, 0.5],
+        mode="lines", line=dict(width=0),
+        showlegend=False, hoverinfo="skip",
     ), row=2, col=1)
 
-    # Target position
-    if product == "TOMATOES":
+    action_spans = _build_spans(d["action"], ts)
+    add_vrects_from_spans(fig, action_spans, ACTION_COLORS, row=2)
+
+    # Legend entries for algo action (invisible dots in legend)
+    for val, label in ACTION_LABELS.items():
+        color = ACTION_COLORS[val].replace("0.55", "0.8").replace("0.45", "0.8")
         fig.add_trace(go.Scatter(
-            x=ts.tolist(), y=d["target"].tolist(),
-            mode="lines",
-            line=dict(color="#94a3b8", width=1, dash="dot"),
-            name="Target position",
-            hoverinfo="skip",
+            x=[None], y=[None], mode="markers",
+            marker=dict(size=10, color=color, symbol="square"),
+            name=label, legendgroup=f"action_{val}",
         ), row=2, col=1)
 
-    # Limit lines
-    for lim, color in [(POS_LIMIT, "#ef4444"), (-POS_LIMIT, "#ef4444")]:
-        fig.add_hline(y=lim, line_dash="dash", line_color=color,
-                      line_width=0.8, row=2, col=1)
-    fig.add_hline(y=0, line_dash="dot", line_color="#94a3b8",
-                  line_width=0.6, row=2, col=1)
+    # ══════════════════════════════════
+    #  ROW 3: POSITION PANEL
+    # ══════════════════════════════════
 
-    # ── Panel 3: PnL ──────────────────────────────────────────────────────────
+    pos  = d["pos"].astype(float)
+    pmin = float(pos.min())
+    pmax = float(pos.max())
+    pad  = max((pmax - pmin) * 0.25, 5.0)
+    y_lo = max(pmin - pad, -POS_LIMIT - 10)
+    y_hi = min(pmax + pad,  POS_LIMIT + 10)
+
     fig.add_trace(go.Scatter(
-        x=ts.tolist(), y=d["rpnl"].tolist(),
+        x=ts.tolist(), y=pos.tolist(),
         mode="lines",
-        line=dict(color="#94a3b8", width=1, dash="dot"),
-        name="Realized PnL",
-        hovertemplate="Realized: %{y:.0f}<extra></extra>",
+        line=dict(color="#38bdf8", width=1.5),
+        fill="tozeroy", fillcolor="rgba(56,189,248,0.10)",
+        name="Position",
+        hovertemplate="Position: %{y:.0f}<extra></extra>",
     ), row=3, col=1)
+
+    # Target step line
     fig.add_trace(go.Scatter(
-        x=ts.tolist(), y=d["pnl"].tolist(),
+        x=ts.tolist(), y=d["target"].tolist(),
         mode="lines",
-        line=dict(color="#22c55e", width=2),
-        name="Total PnL",
-        customdata=cdata,
-        hovertemplate="Total PnL: %{y:.0f}<br>Realized: %{customdata[9]:.0f}<extra></extra>",
+        line=dict(color="#94a3b8", width=1.2, dash="dash"),
+        name="Target position",
+        hovertemplate="Target: %{y:.0f}<extra></extra>",
+        line_shape="hv",
     ), row=3, col=1)
-    # Annotate final value
-    fig.add_annotation(
-        x=ts[-1], y=float(d["pnl"][-1]),
-        text=f"  {d['final_pnl']:+,.0f}",
-        font=dict(size=11, color="#22c55e", family="monospace"),
-        showarrow=False,
-        xanchor="left",
-        row=3, col=1,
-    )
 
-    # ── Panel 4: SIGNAL (EMA diff + thresholds + imbalance) ──────────────────
-    fig.add_hline(y=0, line_color="#94a3b8", line_width=0.6,
-                  line_dash="solid", row=4, col=1)
-    for thr, color, label in [
-        ( STRONG_THR, "#16a34a", f"+STRONG ({STRONG_THR})"),
-        ( MILD_THR,   "#86efac", f"+MILD ({MILD_THR})"),
-        (-MILD_THR,   "#fca5a5", f"−MILD ({MILD_THR})"),
-        (-STRONG_THR, "#dc2626", f"−STRONG ({STRONG_THR})"),
-    ]:
-        fig.add_hline(y=thr, line_dash="dash", line_color=color,
-                      line_width=0.9, row=4, col=1,
-                      annotation_text=label,
-                      annotation_position="right",
-                      annotation_font_size=8,
-                      annotation_font_color=color)
+    # ±Limit as shapes + annotations (not gridlines)
+    for lim, clr in [(POS_LIMIT, "#f87171"), (-POS_LIMIT, "#f87171")]:
+        fig.add_shape(type="line",
+                      x0=float(ts[0]), x1=float(ts[-1]), y0=lim, y1=lim,
+                      line=dict(color=clr, width=0.9, dash="dash"),
+                      row=3, col=1)
+        fig.add_annotation(
+            x=float(ts[-1]), y=float(lim),
+            text=f" {lim:+d} limit",
+            font=dict(size=8, color=clr),
+            showarrow=False, xanchor="left", yanchor="middle",
+            row=3, col=1,
+        )
+    fig.add_shape(type="line",
+                  x0=float(ts[0]), x1=float(ts[-1]), y0=0, y1=0,
+                  line=dict(color="#475569", width=0.5, dash="dot"),
+                  row=3, col=1)
 
+    # ══════════════════════════════════
+    #  ROW 4: P&L PANEL
+    # ══════════════════════════════════
+
+    running_max = np.maximum.accumulate(pnl)
+    pnl_lo = float(np.min(pnl))
+
+    # Drawdown shading: fill between running_max and pnl
     fig.add_trace(go.Scatter(
-        x=ts.tolist(), y=d["diff"].tolist(),
-        mode="lines",
-        line=dict(color="#f59e0b", width=1.5),
-        name="EMA diff (fast−slow)",
-        hovertemplate="EMA diff: %{y:.4f}<extra></extra>",
+        x=ts.tolist(), y=running_max.tolist(),
+        mode="lines", line=dict(width=0),
+        showlegend=False, hoverinfo="skip",
+        name="__dd_top__",
+    ), row=4, col=1)
+    fig.add_trace(go.Scatter(
+        x=ts.tolist(), y=pnl.tolist(),
+        fill="tonexty", fillcolor="rgba(239,68,68,0.13)",
+        mode="lines", line=dict(width=0),
+        showlegend=False, hoverinfo="skip",
+        name="__dd_bot__",
     ), row=4, col=1)
 
-    # L1 volume imbalance on secondary y-axis (row 4)
+    # Realized PnL
+    fig.add_trace(go.Scatter(
+        x=ts.tolist(), y=d["rpnl"].tolist(),
+        mode="lines", line=dict(color="#64748b", width=1.1, dash="dot"),
+        name="Realized PnL",
+        hovertemplate="Realized: %{y:.0f}<extra></extra>",
+    ), row=4, col=1)
+
+    # Total PnL
+    fig.add_trace(go.Scatter(
+        x=ts.tolist(), y=pnl.tolist(),
+        mode="lines", line=dict(color="#4ade80", width=2.2),
+        name="Total PnL",
+        hovertemplate="Total PnL: %{y:.0f}<extra></extra>",
+    ), row=4, col=1)
+
+    # Final value annotation
+    fig.add_annotation(
+        x=float(ts[-1]), y=float(pnl[-1]),
+        text=f"  {d['final_pnl']:+,.0f}",
+        font=dict(size=11, color="#4ade80", family="monospace"),
+        showarrow=False, xanchor="left", row=4, col=1,
+    )
+
+    # Fill tick marks along bottom of PnL panel
+    if d["fills"]:
+        rug_pnl = pnl_lo - abs(pnl_lo) * 0.04 - 5
+        fig.add_trace(go.Scatter(
+            x=[f["ts"] for f in d["fills"]],
+            y=[rug_pnl] * len(d["fills"]),
+            mode="markers",
+            marker=dict(symbol="line-ns-open", size=7,
+                        line=dict(width=1, color="rgba(148,163,184,0.45)")),
+            showlegend=False, hoverinfo="skip", name="__fill_ticks__",
+        ), row=4, col=1)
+
+    # ══════════════════════════════════
+    #  ROW 5: SIGNAL PANEL
+    # ══════════════════════════════════
+
+    diff_arr = d["diff"]
+
+    # Threshold lines with labels
+    for thr, clr, lbl in [
+        ( STRONG_THR, "#22c55e",  f"+STRONG = {STRONG_THR}"),
+        ( MILD_THR,   "#86efac",  f"+MILD = {MILD_THR}"),
+        ( 0,          "#475569",  "0"),
+        (-MILD_THR,   "#fca5a5",  f"−MILD = {MILD_THR}"),
+        (-STRONG_THR, "#ef4444",  f"−STRONG = {STRONG_THR}"),
+    ]:
+        fig.add_shape(type="line",
+                      x0=float(ts[0]), x1=float(ts[-1]),
+                      y0=float(thr), y1=float(thr),
+                      line=dict(color=clr, width=0.8, dash="dash"),
+                      row=5, col=1)
+        if thr != 0:
+            fig.add_annotation(
+                x=float(ts[-1]), y=float(thr),
+                text=f" {lbl}",
+                font=dict(size=8, color=clr),
+                showarrow=False, xanchor="left", yanchor="middle",
+                row=5, col=1,
+            )
+
+    # EMA diff line
+    fig.add_trace(go.Scatter(
+        x=ts.tolist(), y=diff_arr.tolist(),
+        mode="lines", line=dict(color="#facc15", width=1.8),
+        name="EMA diff (fast−slow)",
+        hovertemplate="Diff: %{y:.4f}<extra></extra>",
+    ), row=5, col=1)
+
+    # L1 volume imbalance on secondary y
     fig.add_trace(go.Scatter(
         x=ts.tolist(), y=d["imbalance"].tolist(),
         mode="lines",
@@ -602,136 +692,156 @@ def build_figure(d, product, day):
         name="L1 vol imbalance",
         opacity=0.55,
         hovertemplate="Imbalance: %{y:.2f}<extra></extra>",
-        yaxis="y8",
-    ), row=4, col=1, secondary_y=True)
+    ), row=5, col=1, secondary_y=True)
 
-    # ── Global layout ─────────────────────────────────────────────────────────
+    # ══════════════════════════════════
+    #  GLOBAL LAYOUT
+    # ══════════════════════════════════
+
     fig.update_layout(
         paper_bgcolor="#0f172a",
         plot_bgcolor="#1e293b",
         font=dict(color="#cbd5e1", size=11, family="monospace"),
-        hovermode="x unified",
-        height=900,
+        hovermode="x",
+        height=980,
         title=dict(
-            text=f"<b>{product}</b>  —  Day {day:+d}  |  Round 0",
+            text=f"<b>{product}</b>  ·  Day {day:+d}  ·  Round 0",
             font=dict(size=15, color="#f1f5f9"),
             x=0.5,
         ),
         legend=dict(
-            orientation="v",
-            x=1.01, y=1,
-            bgcolor="rgba(30,41,59,0.9)",
-            bordercolor="#334155",
-            borderwidth=1,
-            font=dict(size=10),
+            orientation="v", x=1.01, y=0.98,
+            bgcolor="rgba(15,23,42,0.9)",
+            bordercolor="#334155", borderwidth=1,
+            font=dict(size=9.5),
         ),
-        margin=dict(l=70, r=190, t=60, b=50),
+        margin=dict(l=70, r=210, t=55, b=50),
     )
 
-    # Axis styling
-    ax_style = dict(
-        gridcolor="#334155", zerolinecolor="#475569",
-        showspikes=True, spikemode="across", spikethickness=1,
-        spikecolor="#64748b", spikedash="dot",
-    )
-    for row_i in range(1, 5):
-        fig.update_xaxes(row=row_i, col=1, **ax_style)
-        fig.update_yaxes(row=row_i, col=1,
-                         gridcolor="#334155", zerolinecolor="#475569")
+    # Spike crosshair on all x-axes (draws vertical line across all panels)
+    spike_kw = dict(showspikes=True, spikemode="across",
+                    spikethickness=1, spikecolor="#64748b",
+                    spikedash="dot", spikesnap="cursor")
+    grid_kw  = dict(gridcolor="#1e3a5f", zerolinecolor="#334155")
 
-    fig.update_xaxes(title_text="Time (seconds into day)", row=4, col=1)
-    fig.update_yaxes(title_text="Price",     row=1, col=1)
-    fig.update_yaxes(title_text="Position",  row=2, col=1, range=[-95, 95])
-    fig.update_yaxes(title_text="P&L",       row=3, col=1)
-    fig.update_yaxes(title_text="EMA diff",  row=4, col=1,
-                     secondary_y=False)
-    fig.update_yaxes(title_text="Imbalance", row=4, col=1,
-                     secondary_y=True,
+    for r in range(1, 6):
+        fig.update_xaxes(row=r, col=1, **spike_kw, **grid_kw)
+        fig.update_yaxes(row=r, col=1, **grid_kw)
+
+    # Per-axis customisation
+    fig.update_yaxes(title_text="Price",    row=1, col=1)
+    fig.update_yaxes(row=2, col=1,          # algo strip — hide y
+                     showticklabels=False, showgrid=False,
+                     zeroline=False, showline=False, range=[0, 1])
+    fig.update_yaxes(title_text="Position", row=3, col=1,
+                     range=[y_lo, y_hi])
+    fig.update_yaxes(title_text="P&L",      row=4, col=1)
+    fig.update_yaxes(title_text="EMA diff", row=5, col=1, secondary_y=False)
+    fig.update_yaxes(title_text="Imbalance", row=5, col=1, secondary_y=True,
                      range=[-1.5, 1.5],
-                     tickfont=dict(color="#38bdf8", size=9))
+                     tickfont=dict(color="#38bdf8", size=9),
+                     gridcolor="#1e3a5f")
+    fig.update_xaxes(title_text="Time (seconds into day)", row=5, col=1)
 
     return fig
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# 5.  HTML OUTPUT
-# ═══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# 6.  HTML OUTPUT
+# ══════════════════════════════════════════════════════════════════════════════
 
 def make_html(fig, d, product, day) -> str:
-    chart_html = fig.to_html(full_html=False, include_plotlyjs="cdn",
-                              config={"scrollZoom": True, "displaylogo": False})
+    chart_html = fig.to_html(
+        full_html=False, include_plotlyjs="cdn",
+        config={"scrollZoom": True, "displaylogo": False,
+                "modeBarButtonsToRemove": ["lasso2d", "select2d"]},
+    )
 
-    rt = d["regime_time"]
-    total_t = sum(rt.values()) or 1
+    rt   = d["regime_time"]
+    ttot = max(sum(rt.values()), 1)
+
+    em_note = ""
+    if product == "EMERALDS":
+        em_note = """
+<div style="background:#1c2f4a;border:1px solid #334155;border-radius:6px;
+            padding:10px 16px;margin-top:10px;font-size:12px;color:#94a3b8;">
+  ⚡ <b style="color:#f1f5f9">EMERALDS note:</b>
+  Price is pegged at FV&nbsp;=&nbsp;10&nbsp;000 — EMA diff stays near zero, regime
+  classification is unused.  Strategy always posts passive quotes at
+  FV&nbsp;±&nbsp;8&nbsp;(bid&nbsp;9992&nbsp;/&nbsp;ask&nbsp;10008).
+  Fills happen when other participants' orders cross our passive quotes.
+  Signal panel shows EMA diff for completeness but it has no decision value here.
+</div>"""
 
     summary = f"""
 <div style="font-family:monospace;background:#1e293b;color:#cbd5e1;
-            padding:18px 24px;border-radius:8px;margin:20px auto;
-            max-width:820px;line-height:1.8;font-size:13px;">
-  <b style="color:#f1f5f9;font-size:15px;">
-    {product} · Day {day:+d} · Summary
-  </b><br><br>
-  <table style="border-collapse:collapse;width:100%">
+            padding:18px 28px;border-radius:8px;margin:18px auto;
+            max-width:900px;line-height:1.9;font-size:13px;">
+  <b style="color:#f1f5f9;font-size:15px;">{product} · Day {day:+d} · Summary</b>
+  {em_note}
+  <br>
+  <table style="border-collapse:collapse;width:100%;margin-top:6px">
     <tr>
-      <td style="padding:3px 16px 3px 0"><span style="color:#94a3b8">Total fills</span></td>
+      <td style="padding:2px 20px 2px 0;color:#94a3b8">Total fills</td>
       <td><b style="color:#f1f5f9">{d['total_fills']}</b></td>
-      <td style="padding:3px 16px 3px 32px"><span style="color:#94a3b8">Total volume</span></td>
+      <td style="padding:2px 20px 2px 28px;color:#94a3b8">Total volume</td>
       <td><b style="color:#f1f5f9">{d['total_volume']}</b></td>
     </tr>
     <tr>
-      <td style="padding:3px 16px 3px 0"><span style="color:#94a3b8">Final PnL</span></td>
-      <td><b style="color:#22c55e">{d['final_pnl']:+,.0f}</b></td>
-      <td style="padding:3px 16px 3px 32px"><span style="color:#94a3b8">Max drawdown</span></td>
-      <td><b style="color:#ef4444">{d['drawdown']:,.0f}</b></td>
+      <td style="color:#94a3b8">Final PnL</td>
+      <td><b style="color:#4ade80">{d['final_pnl']:+,.0f}</b></td>
+      <td style="padding:2px 20px 2px 28px;color:#94a3b8">Max drawdown</td>
+      <td><b style="color:#f87171">{d['drawdown']:,.0f}</b></td>
     </tr>
   </table>
   <br>
-  <b style="color:#94a3b8">Time in regime:</b><br>
-  <span style="color:#64748b">  Neutral:        </span>
-  <b>{rt['neutral']:.0f}s ({rt['neutral']/total_t*100:.0f}%)</b><br>
-  <span style="color:#fca5a5">  Mild bearish:   </span>
-  <b>{rt['mild_bearish']:.0f}s ({rt['mild_bearish']/total_t*100:.0f}%)</b><br>
-  <span style="color:#ef4444">  Strong bearish: </span>
-  <b>{rt['strong_bearish']:.0f}s ({rt['strong_bearish']/total_t*100:.0f}%)</b><br>
-  <span style="color:#86efac">  Mild bullish:   </span>
-  <b>{rt['mild_bullish']:.0f}s ({rt['mild_bullish']/total_t*100:.0f}%)</b><br>
-  <span style="color:#16a34a">  Strong bullish: </span>
-  <b>{rt['strong_bullish']:.0f}s ({rt['strong_bullish']/total_t*100:.0f}%)</b>
+  <b style="color:#94a3b8">Time in regime (MILD_THR={MILD_THR}, STRONG_THR={STRONG_THR}):</b><br>
+  <span style="color:#64748b">&nbsp; Neutral&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+  </span><b>{rt['neutral']:.0f}s ({rt['neutral']/ttot*100:.0f}%)</b><br>
+  <span style="color:#fca5a5">&nbsp; Mild bearish &nbsp;
+  </span><b>{rt['mild_bearish']:.0f}s ({rt['mild_bearish']/ttot*100:.0f}%)</b><br>
+  <span style="color:#ef4444">&nbsp; Strong bearish
+  </span><b>{rt['strong_bearish']:.0f}s ({rt['strong_bearish']/ttot*100:.0f}%)</b><br>
+  <span style="color:#86efac">&nbsp; Mild bullish &nbsp;
+  </span><b>{rt['mild_bullish']:.0f}s ({rt['mild_bullish']/ttot*100:.0f}%)</b><br>
+  <span style="color:#4ade80">&nbsp; Strong bullish
+  </span><b>{rt['strong_bullish']:.0f}s ({rt['strong_bullish']/ttot*100:.0f}%)</b>
 </div>"""
 
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>IMC P4 — {product} Day {day:+d}</title>
+  <title>IMC P4 · {product} Day {day:+d}</title>
   <style>
-    body {{background:#0f172a;margin:0;padding:0;}}
-    .header {{background:#1e293b;border-bottom:1px solid #334155;
-              padding:16px 32px;color:#f1f5f9;font-family:monospace;
-              display:flex;align-items:center;gap:20px;}}
-    .header h1 {{font-size:1.1rem;margin:0;}}
-    .header span {{color:#94a3b8;font-size:0.85rem;}}
-    .hint {{font-size:0.78rem;color:#64748b;text-align:center;
-            padding:6px;font-family:monospace;}}
+    * {{box-sizing:border-box;margin:0;padding:0;}}
+    body {{background:#0f172a;}}
+    .hdr {{background:#1e293b;border-bottom:1px solid #334155;
+           padding:14px 28px;color:#f1f5f9;font-family:monospace;
+           display:flex;align-items:center;justify-content:space-between;}}
+    .hdr h1 {{font-size:1.05rem;}}
+    .hdr span {{font-size:0.8rem;color:#64748b;}}
+    .hint {{text-align:center;font-family:monospace;font-size:0.75rem;
+            color:#475569;padding:4px;}}
   </style>
 </head>
 <body>
-  <div class="header">
+  <div class="hdr">
     <h1>IMC Prosperity 4 · Round 0 · {product} · Day {day:+d}</h1>
-    <span>Scroll to zoom · Drag to pan · Hover for unified tooltip</span>
+    <span>Hover → spike crosshair on all panels · Scroll to zoom · Drag to pan</span>
   </div>
   {summary}
   <div class="hint">
-    Panel order ↓: Price (mid + bid/ask + EMAs + fills) · Position · P&L · Signal (EMA diff + imbalance)
+    ↓ Price · Algo action · Position · P&amp;L · Signal (EMA diff + imbalance)
   </div>
   {chart_html}
 </body>
 </html>"""
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# 6.  MAIN
-# ═══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# 7.  MAIN
+# ══════════════════════════════════════════════════════════════════════════════
 
 def main():
     print("Running backtest…")
@@ -745,25 +855,30 @@ def main():
         pass
 
     days = sorted({r["day"] for r in rows})
-    print(f"Days: {days}")
+    print(f"Days found: {days}\n")
 
     for product in ["EMERALDS", "TOMATOES"]:
         for day_idx, day in enumerate(days):
-            print(f"  Building {product} Day {day:+d}…", end=" ", flush=True)
+            label = f"{product} Day {day:+d}"
+            print(f"  [{label}]  extracting…", end=" ", flush=True)
             d = extract(rows, trades, product, day, day_idx)
             if d is None:
-                print("no data, skipping.")
+                print("no data — skipped.")
                 continue
-
+            print(f"fills={d['total_fills']}  vol={d['total_volume']}  "
+                  f"PnL={d['final_pnl']:+,.0f}", end="  |  building chart…", flush=True)
             fig  = build_figure(d, product, day)
             html = make_html(fig, d, product, day)
-
             fname = f"analysis_{product}_day{day}.html"
             with open(fname, "w") as f:
                 f.write(html)
-            print(f"→ {fname}  (fills: {d['total_fills']}, PnL: {d['final_pnl']:+,.0f})")
+            print(f"→ {fname}")
 
-    print("\nDone. Open the 4 HTML files in your browser.")
+    print("\nAll done. Open 4 HTML files in your browser.")
+    print("  analysis_EMERALDS_day-2.html")
+    print("  analysis_EMERALDS_day-1.html")
+    print("  analysis_TOMATOES_day-2.html")
+    print("  analysis_TOMATOES_day-1.html")
 
 
 if __name__ == "__main__":
