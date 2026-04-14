@@ -91,19 +91,21 @@ PARAMS = {
         # fair = mid - 0.40*(mid-ema) + 3.5*imb + 2.0*(l2m-l1m)
         # OLS slopes: imb≈8.5 shrunk to 3.5; l2l1≈2.28 shrunk to 2.0.
         # default_edge=7: penny-improve MM who posts at ±8 from fair.
+        # TUNED: ema_alpha=0.08 (smoother EMA → stronger reversion signal),
+        #        soft_position_limit=78 (near-max inventory → more passive fills).
         'fair_mode': 'ema_reversion',
-        'ema_alpha': 0.10,
+        'ema_alpha': 0.08,
         'reversion_coef': 0.40,
         'imb_coef': 3.5,
-        'l2l1_coef': 2.0,          # NEW: combined signal (corr 0.63-0.65)
+        'l2l1_coef': 2.0,          # combined signal (corr 0.63-0.65)
         'take_width': 2,
         'clear_width': 1,
         'prevent_adverse': True,
         'adverse_volume': 15,
         'disregard_edge': 1,
         'join_edge': 0,
-        'default_edge': 7,          # CHANGED 2→7: penny-improve MM at ±8
-        'soft_position_limit': 40,
+        'default_edge': 7,          # penny-improve MM at ±8
+        'soft_position_limit': 78,
         'levels': 2,
         'use_l2l1_signal': True,
     },
@@ -111,26 +113,26 @@ PARAMS = {
         # PEPPER: Pure long drift strategy. Never sell.
         # OU half-life = 0.1 ticks → spread edge is near-zero.
         # All profit from holding max-long into +1000/day drift.
-        # take_width=-2: grab rare cheap asks (≤ trend+2, 1.7% of ticks).
-        # default_edge=3: bid at trend-3, aligned to discrete ±3 jump grid.
+        # TUNED: take_width=-8 captures asks at trend+7-8 (was missing at -7);
+        #        default_edge=-6 tighter passive bid for earlier position build.
         # buy_only=True: no ask orders ever.
         'fair_mode': 'drift_plus_reversion',
         'ema_alpha': 0.05,
         'reversion_coef': 0.60,
         'imb_coef': 0,
         'l2l1_coef': 0,
-        'take_width': -7,           # FIX: take asks ≤ fair+7 ≈ trend+7 (ask sits at trend+6-7)
+        'take_width': -8,           # TUNED: take asks ≤ fair+8 (was -7; catches trend+7-8 asks)
         'clear_width': 1,
         'prevent_adverse': True,
         'adverse_volume': 15,
         'disregard_edge': 1,
         'join_edge': 0,
-        'default_edge': -5,         # FIX: bid at fair+5 ≈ trend+5, just below typical ask (trend+6)
+        'default_edge': -6,         # TUNED: bid at fair+6 ≈ trend+6 (was -5)
         'soft_position_limit': 80,
         'levels': 4,
         'use_drift': True,
         'use_l2l1_signal': True,
-        'buy_only': True,           # NEW: never place ask orders
+        'buy_only': True,           # never place ask orders
     },
 }
 

@@ -52,8 +52,10 @@ PARAMS = {
         # EMA reversion + volume imbalance + L2-L1 signal (OLS-derived).
         # fair = mid - 0.40*(mid-ema) + 3.5*imb + 2.0*(l2m-l1m)
         # default_edge=7: penny-improve the MM who posts at ±8 from fair.
+        # Tuned: ema_alpha=0.08 (smoother EMA → better reversion signal),
+        #        soft_position_limit=78 (allow near-max inventory for more fills).
         'fair_mode': 'ema_reversion',
-        'ema_alpha': 0.10,
+        'ema_alpha': 0.08,
         'reversion_coef': 0.40,
         'imb_coef': 3.5,
         'l2l1_coef': 2.0,
@@ -64,28 +66,30 @@ PARAMS = {
         'disregard_edge': 1,
         'join_edge': 0,
         'default_edge': 7,          # penny-improve MM at ±8
-        'soft_position_limit': 40,
+        'soft_position_limit': 78,
         'levels': 2,
         'use_l2l1_signal': True,
         'buy_only': False,
     },
     PEPPER: {
         # Pure long drift strategy. Never sell.
-        # take_width=-7: grab any ask ≤ fair+7 (ask typically at trend+6-7).
-        # default_edge=-5: passive bid at fair+5 ≈ just below typical ask.
+        # take_width=-8: grab any ask ≤ fair+8 (catches asks at trend+7-8).
+        # default_edge=-6: passive bid at fair+6 ≈ just below typical ask.
         # buy_only=True: never place ask orders.
+        # Tuned: take_width=-8 (was -7) captures t=0 ask at trend+7.4;
+        #        default_edge=-6 (was -5) tighter passive bid for more fills.
         'fair_mode': 'drift_plus_reversion',
         'ema_alpha': 0.05,
         'reversion_coef': 0.60,
         'imb_coef': 0,
         'l2l1_coef': 0,
-        'take_width': -7,
+        'take_width': -8,
         'clear_width': 1,
         'prevent_adverse': True,
         'adverse_volume': 15,
         'disregard_edge': 1,
         'join_edge': 0,
-        'default_edge': -5,         # bid at fair+5 ≈ trend+5, just below typical ask
+        'default_edge': -6,         # bid at fair+6 ≈ trend+6, below typical ask
         'soft_position_limit': 80,
         'levels': 4,
         'use_drift': True,
