@@ -1,46 +1,57 @@
 """Round 1 trader – ASH_COATED_OSMIUM + INTARIAN_PEPPER_ROOT.
 
-FINAL STRATEGY (3-day backtest: 174,875 total, worst day 42,802)
+STRATEGY v2 — 7 data-driven improvements over v1
 
-ANALYSIS FINDINGS (3 days of Round 1 historical data):
+DATA ANALYSIS (3-day deep analysis, days -2/-1/0):
 
   ASH_COATED_OSMIUM:
-    - Pure OU process (mean-reverting to slowly-moving mean near 10,000)
-    - lag-1 autocorr = -0.50, lag-2/3/5/10 all ~0 (clean AR(1))
-    - Best fair value model (R²=0.45, replicates 3/3 days):
-        ema[t] = 0.10 * mid + 0.90 * ema[t-1]
-        fair = mid - 0.50 * (mid - ema) + 3.5 * volume_imbalance
-    - L1 volume imbalance has correlation +0.64 with next-tick return
-    - Realistic MM ceiling: ~3,300/day (we capture ~2,300, 70%)
+    - Pure AR(1) OU process: lag-1 autocorr = -0.499, lag-2/5 ≈ 0 (no multi-lag signal)
+    - Volume imbalance → next-tick return corr: +0.58–0.60 (all 3 days)
+    - L2-L1 mid diff → next-tick return corr: +0.62–0.65 (all 3 days, independent!)
+    - Spread distribution: 63% at 16 ticks, 25% at 18–19 ticks (MM posts at ±8 from fair)
+    - L1 volumes: mostly 10–15 per side (avg 14.1 bid / 14.1 ask)
+    - Book moves ≥1 tick in 25% of ticks each direction
+    - Fair value model: fair = mid - 0.40*(mid-ema) + 3.5*imb + 2.0*(l2m-l1m)
+      OLS-derived, both signals combined push R² from 0.45 toward ~0.55
 
   INTARIAN_PEPPER_ROOT:
-    - Deterministic linear drift: +0.1 per tick (+1000 per day), replicates 3/3
-    - Within the drift, lag-1 autocorr = -0.45 (OU around drift line)
-    - Best fair value model (R²=0.48):
-        ema[t] = 0.05 * mid + 0.95 * ema[t-1]  (slower than ASH)
-        fair = mid - 0.60 * (mid - ema) + drift_per_tick
-    - Realistic MM ceiling from spread alone: ~2,000/day
-    - Drift accumulation captures ~45-60k/day on top of spread PnL
-    - We capture the drift by quoting aggressively two-sided (edge=0, levels=4);
-      as the market drifts up, our buy orders fill more than our sell orders,
-      naturally accumulating a long position that marks up with the drift.
+    - Perfect linear drift: slope = +0.001/tick exactly (R² = 1.0000), all 3 days
+    - Detrended lag-1 autocorr = -0.497 (same OU as ASH)
+    - OU half-life = 0.1–0.2 ticks (residuals vanish in ONE tick — no reversion profit)
+    - Ask sits consistently 5.9–7.1 ticks ABOVE the trend line (98.3% of ticks)
+    - Bid/ask moves in discrete ±3 jumps (not continuous ticks)
+    - CONCLUSION: Spread capture on PEPPER is near-zero; ALL profit comes from
+      holding max-long and marking up with the +1000/day drift.
+      Max theoretical: 80 × 1000 = 80,000/day.
 
-KEY DESIGN DECISIONS:
+7 IMPROVEMENTS vs v1:
 
-  1. Fair value is a shrunk OLS prediction, not just mid or MM-mid.
-     Both products use ema_reversion / drift_plus_reversion formulas.
-  2. ASH uses wider default_edge (2) because its std is larger. PEPPER
-     uses edge=0 because the drift means "quoting at fair" is actually
-     "quoting slightly below next-tick fair" — high fill rate.
-  3. PEPPER soft_position_limit=80 (= hard limit) allows full drift
-     exposure. Tightening this costs profit proportionally.
-  4. PEPPER levels=4 spreads quotes across 4 price points to maximize
-     capture during the drift.
-  5. No directional bias flag (use_directional_bias=False). The drift
-     accumulation happens naturally from aggressive two-sided quoting;
-     an explicit bias would be redundant and harder to tune.
-  6. L2-L1 signal flips the bid/ask level count asymmetrically when
-     a wall appears on one side (Round 0 discovery, still applies).
+  1. EMA stale-state reset: if |mid - ema| > 50, hard-reset EMA to mid.
+     Prevents blowup at day boundaries (v1 bug: day-0 EMA = 13000 carries
+     into day-1 start at 14000, causing 600-tick fair-value error for ~14 ticks).
+
+  2. ASH default_edge = 7 (was 2): MM posts at ±8 from fair. We penny-improve
+     to ±7. Only relevant when book is empty (18% of ticks); penny-improve
+     logic already handles it when book has quotes.
+
+  3. ASH combined signal fair value: add L2-L1 coefficient (l2l1_coef=2.0).
+     Slope from OLS: 0.635 × 3.69 / 1.03 ≈ 2.28, shrunk to 2.0.
+     Both signals are independent — combined R² >> individual.
+
+  4. ASH wide-spread regime filter: when spread ≤ 12 (unusual 9% regime),
+     the MM stepped back. We stay in but raise default_edge to 5 to avoid
+     quoting inside a potentially adversely-selected spread.
+
+  5. PEPPER buy_only=True (new): never place ask orders. Every sell gives up
+     drift profit (1000 ticks/day × 80 contracts). Two-sided MM on PEPPER
+     is wrong — the OU half-life of 0.1 ticks means spread edge is near-zero.
+
+  6. PEPPER default_edge = 3 (was 0): bid at trend − 3, aligned with the
+     discrete ±3 jump grid the MM uses. Higher fill probability vs. quoting
+     at trend ± 0.
+
+  7. PEPPER take_width = -2: take any ask ≤ fair + 2 ≈ trend + 2. These
+     rare cheap-ask events (1.7% of ticks, ask below trend+3) are free money.
 
 POSITION LIMITS: 80 per product (from Round 1 brief).
 """
@@ -76,51 +87,50 @@ PARAMS = {
     # FINAL TUNED PARAMS (Round 1, 3-day backtest: 174,875, worst day 42,802)
     # ─────────────────────────────────────────────────────────────────────
     ASH: {
-        # ASH: OLS-derived fair value model (R²=0.45, replicates across 3 days).
-        # fair = mid - 0.40*(mid - ema) + 3.5*imbalance
-        # where ema = 0.10*mid + 0.90*ema[t-1]
-        # Tuned: take_width=2 captures more mispriced offers, clear_width=1
-        # closes positions faster, reversion_coef=0.40 is shrunk from OLS 0.50.
+        # ASH: Combined fair value model — EMA reversion + imbalance + L2-L1 signal.
+        # fair = mid - 0.40*(mid-ema) + 3.5*imb + 2.0*(l2m-l1m)
+        # OLS slopes: imb≈8.5 shrunk to 3.5; l2l1≈2.28 shrunk to 2.0.
+        # default_edge=7: penny-improve MM who posts at ±8 from fair.
         'fair_mode': 'ema_reversion',
         'ema_alpha': 0.10,
         'reversion_coef': 0.40,
         'imb_coef': 3.5,
+        'l2l1_coef': 2.0,          # NEW: combined signal (corr 0.63-0.65)
         'take_width': 2,
         'clear_width': 1,
         'prevent_adverse': True,
         'adverse_volume': 15,
         'disregard_edge': 1,
         'join_edge': 0,
-        'default_edge': 2,
+        'default_edge': 7,          # CHANGED 2→7: penny-improve MM at ±8
         'soft_position_limit': 40,
         'levels': 2,
         'use_l2l1_signal': True,
     },
     PEPPER: {
-        # PEPPER: detrended OLS reversion + deterministic +0.1/tick drift.
-        # fair = mid - 0.60*(mid - ema) + drift_per_tick
-        # where ema = 0.05*mid + 0.95*ema[t-1]  (slower than ASH)
-        # Tuned: default_edge=0 quotes right at fair (drift keeps us ahead),
-        # levels=4 spreads quotes across many price points for max capture,
-        # soft_position_limit=80 allows full exposure to drift accumulation,
-        # clear_width=1 closes inventory slightly above fair.
+        # PEPPER: Pure long drift strategy. Never sell.
+        # OU half-life = 0.1 ticks → spread edge is near-zero.
+        # All profit from holding max-long into +1000/day drift.
+        # take_width=-2: grab rare cheap asks (≤ trend+2, 1.7% of ticks).
+        # default_edge=3: bid at trend-3, aligned to discrete ±3 jump grid.
+        # buy_only=True: no ask orders ever.
         'fair_mode': 'drift_plus_reversion',
         'ema_alpha': 0.05,
         'reversion_coef': 0.60,
         'imb_coef': 0,
-        'take_width': 1,
+        'l2l1_coef': 0,
+        'take_width': -2,           # CHANGED 1→-2: take cheap asks ≤ fair+2
         'clear_width': 1,
         'prevent_adverse': True,
         'adverse_volume': 15,
         'disregard_edge': 1,
         'join_edge': 0,
-        'default_edge': 0,
+        'default_edge': 3,          # CHANGED 0→3: bid at trend-3 (discrete grid)
         'soft_position_limit': 80,
         'levels': 4,
         'use_drift': True,
-        'use_directional_bias': False,
-        'directional_bias_size': 0,
         'use_l2l1_signal': True,
+        'buy_only': True,           # NEW: never place ask orders
     },
 }
 
@@ -369,10 +379,12 @@ class Trader:
         best_ask = min(order_depth.sell_orders.keys())
         l1_mid = (best_bid + best_ask) / 2
 
-        # Update EMA
+        # Update EMA — with stale-state reset guard (improvement #1)
+        # If EMA is >50 from mid (e.g. day boundary jump), reset it immediately
+        # to avoid a multi-tick fair-value error at the start of each new day.
         alpha = p.get('ema_alpha', 0.10)
         prev_ema = trader_obj.get(ema_key)
-        if prev_ema is None:
+        if prev_ema is None or abs(l1_mid - prev_ema) > 50:
             ema = l1_mid
         else:
             ema = alpha * l1_mid + (1 - alpha) * prev_ema
@@ -397,6 +409,19 @@ class Trader:
         # Apply imbalance correction
         imb_coef = p.get('imb_coef', 0.0)
         fair += imb_coef * imb
+
+        # Apply L2-L1 mid signal (improvement #3 — independent predictor for ASH)
+        # L2-L1 diff has corr 0.63-0.65 with next-tick return (all 3 days).
+        l2l1_coef = p.get('l2l1_coef', 0.0)
+        if l2l1_coef != 0.0:
+            try:
+                sb = sorted(order_depth.buy_orders.items(), reverse=True)
+                sa = sorted(order_depth.sell_orders.items())
+                if len(sb) >= 2 and len(sa) >= 2:
+                    l2m = (sb[1][0] + sa[1][0]) / 2
+                    fair += l2l1_coef * (l2m - l1_mid)
+            except Exception:
+                pass
 
         # Apply drift (PEPPER only)
         if p.get('use_drift', False):
@@ -441,17 +466,24 @@ class Trader:
 
             orders: List[Order] = []
             bov = sov = 0
+            buy_only = p.get('buy_only', False)
 
             # Phase 1: Take
+            # For buy_only products, take_best_orders will only fire on the buy
+            # side (sell side needs bid > fair + take_width; with take_width=-2
+            # that means bid > fair+2 ≈ trend+2, which never happens).
             bov, sov = self.take_best_orders(
                 product, fair, p['take_width'], orders, od, pos, bov, sov,
                 prevent_adverse=p.get('prevent_adverse', False),
                 adverse_volume=p.get('adverse_volume', 0),
             )
-            # Phase 2: Clear
-            bov, sov = self.clear_position_order(
-                product, fair, p['clear_width'], orders, od, pos, bov, sov,
-            )
+
+            # Phase 2: Clear — skip for buy_only products (improvement #5)
+            # Never unwind a long PEPPER position; every unit held = drift profit.
+            if not buy_only:
+                bov, sov = self.clear_position_order(
+                    product, fair, p['clear_width'], orders, od, pos, bov, sov,
+                )
 
             # L2-L1 signal for asymmetric level selection
             base_lvl = p.get('levels', 2)
@@ -465,18 +497,27 @@ class Trader:
                     bid_lvl = max(1, base_lvl - 1)
                     ask_lvl = base_lvl + 1
 
-            # Directional bias for PEPPER (bias long to ride +100 drift)
-            soft_bias = 0
-            if p.get('use_directional_bias', False):
-                soft_bias = p.get('directional_bias_size', 0)
+            # buy_only: never quote asks (improvement #5)
+            if buy_only:
+                ask_lvl = 0
+
+            # ASH wide-spread regime filter (improvement #4):
+            # When spread ≤ 12 (unusual — 9% of ticks), the normal MM has
+            # stepped back. Widen our default_edge to 5 to avoid quoting
+            # inside a potentially adversely-selected spread.
+            effective_edge = p['default_edge']
+            if product == ASH and od.buy_orders and od.sell_orders:
+                current_spread = min(od.sell_orders) - max(od.buy_orders)
+                if current_spread <= 12:
+                    effective_edge = max(effective_edge, 5)
 
             # Phase 3: Make
             make_orders, _, _ = self.make_orders(
                 product, od, fair, pos, bov, sov,
-                p['disregard_edge'], p['join_edge'], p['default_edge'],
+                p['disregard_edge'], p['join_edge'], effective_edge,
                 manage_position=True,
                 soft_position_limit=p['soft_position_limit'],
-                soft_position_bias=soft_bias,
+                soft_position_bias=0,
                 bid_levels=bid_lvl,
                 ask_levels=ask_lvl,
             )
