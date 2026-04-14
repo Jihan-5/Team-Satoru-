@@ -119,13 +119,13 @@ PARAMS = {
         'reversion_coef': 0.60,
         'imb_coef': 0,
         'l2l1_coef': 0,
-        'take_width': -2,           # CHANGED 1→-2: take cheap asks ≤ fair+2
+        'take_width': -7,           # FIX: take asks ≤ fair+7 ≈ trend+7 (ask sits at trend+6-7)
         'clear_width': 1,
         'prevent_adverse': True,
         'adverse_volume': 15,
         'disregard_edge': 1,
         'join_edge': 0,
-        'default_edge': 3,          # CHANGED 0→3: bid at trend-3 (discrete grid)
+        'default_edge': -5,         # FIX: bid at fair+5 ≈ trend+5, just below typical ask (trend+6)
         'soft_position_limit': 80,
         'levels': 4,
         'use_drift': True,
@@ -213,7 +213,7 @@ class Trader:
     def take_best_orders(
         self, product, fair_value, take_width, orders, order_depth,
         position, buy_order_volume, sell_order_volume,
-        prevent_adverse=False, adverse_volume=0,
+        prevent_adverse=False, adverse_volume=0, buy_only=False,
     ):
         limit = POS_LIMITS[product]
 
@@ -230,7 +230,8 @@ class Trader:
                         if order_depth.sell_orders[best_ask] == 0:
                             del order_depth.sell_orders[best_ask]
 
-        if len(order_depth.buy_orders) != 0:
+        # FIX Bug 3: skip sell side entirely for buy_only products
+        if not buy_only and len(order_depth.buy_orders) != 0:
             best_bid = max(order_depth.buy_orders.keys())
             best_bid_amt = order_depth.buy_orders[best_bid]
             if not prevent_adverse or abs(best_bid_amt) <= adverse_volume:
@@ -469,13 +470,13 @@ class Trader:
             buy_only = p.get('buy_only', False)
 
             # Phase 1: Take
-            # For buy_only products, take_best_orders will only fire on the buy
-            # side (sell side needs bid > fair + take_width; with take_width=-2
-            # that means bid > fair+2 ≈ trend+2, which never happens).
+            # For buy_only products, sell side is skipped entirely via buy_only flag.
+            # take_width=-7: buys any ask ≤ fair+7 ≈ trend+7, capturing the typical ask.
             bov, sov = self.take_best_orders(
                 product, fair, p['take_width'], orders, od, pos, bov, sov,
                 prevent_adverse=p.get('prevent_adverse', False),
                 adverse_volume=p.get('adverse_volume', 0),
+                buy_only=buy_only,
             )
 
             # Phase 2: Clear — skip for buy_only products (improvement #5)
