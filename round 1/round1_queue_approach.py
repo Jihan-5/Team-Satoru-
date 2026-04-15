@@ -18,10 +18,10 @@ Changes vs round1_trader_FINAL.py:
   B3:  Queue-priority quoting: join small queue, penny-improve large
   B4:  Spread term added to ASH fair value model
 
-Backtest vs FINAL (3-day, seed=42): -19,432
-PARAMS use proven OLS coefs (reversion=0.40, imb=3.5, l2l1=2.0).
-inventory_penalty=0.04 and microprice are active but not yet net-positive
-on this dataset — tune these two params to close the gap.
+Sweep results (18 combos: microprice on/off × inv 0.0–0.10):
+  Best: mid + inv=0.03 → 248,477  (FINAL=265,478, delta=-17,002)
+  microprice uniformly worse than plain mid on this dataset.
+  Gap vs FINAL is structural (different fill ordering from refactor).
 """
 from datamodel import OrderDepth, TradingState, Order
 try:
@@ -66,7 +66,7 @@ PARAMS = {
         'imb_coef': 3.5,            # OLS-validated
         'l2l1_coef': 2.0,           # OLS-validated
         'spread_coef': 0.0,         # off by default; tune separately
-        'inventory_penalty': 0.04,  # A4/B2: fair -= pos * this (~3 ticks at pos=78)
+        'inventory_penalty': 0.03,  # A4/B2: best from sweep (0.03 w/ mid, 248,477)
         'take_width': 2,
         'clear_width': 1,
         'prevent_adverse': True,
@@ -358,12 +358,9 @@ class Trader:
 
         spread = best_ask - best_bid
 
-        # B1: Microprice (volume-weighted mid)
+        # B1: mid price (microprice tested but mid+inv=0.03 was best in sweep)
         total_vol = best_bid_vol + best_ask_vol
-        if total_vol > 0:
-            microprice = (best_bid * best_ask_vol + best_ask * best_bid_vol) / total_vol
-        else:
-            microprice = (best_bid + best_ask) / 2.0
+        microprice = (best_bid + best_ask) / 2.0
 
         # A8: EMA with stale + timestamp-gap reset
         ema_key    = f'{product}_ema'
