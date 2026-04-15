@@ -7,7 +7,7 @@ Changes vs round1_trader_FINAL.py:
   A2:  get_book_levels() called once per tick — no repeated sorting
   A3:  Signals kept in tick units; spread_coef term added (B4)
   A4:  Inventory skew shifts fair value (fair -= pos * inventory_penalty)
-  A5:  PEPPER overshoot sell valve (pos > 60 and bid > fair+15)
+  A5:  REMOVED — overshoot sell valve caused live loss (sold at 12051, rebought at 12066)
   A6:  Explicit take thresholds (buy_threshold = fair - take_width)
   A7:  Tight-spread regime: levels → 1, edge widens
   A8:  Timestamp-gap EMA reset (catches day boundaries)
@@ -99,8 +99,6 @@ PARAMS = {
         'use_drift': True,
         'use_l2l1_signal': True,
         'buy_only': True,
-        'overshoot_sell_pos': 60,   # A5: allow sell when pos exceeds this
-        'overshoot_sell_edge': 15,  # A5: and best_bid > fair + this
     },
 }
 
@@ -453,12 +451,7 @@ class Trader:
             orders: List[Order] = []
             bov = sov = 0
             buy_only = p.get('buy_only', False)
-
-            # A5: PEPPER overshoot sell valve
             allow_sell = not buy_only
-            if buy_only and pos > p.get('overshoot_sell_pos', 999) and best_bid is not None:
-                if best_bid > fair + p.get('overshoot_sell_edge', 15):
-                    allow_sell = True   # temporarily lift buy_only restriction
 
             # Phase 1: Take
             bov, sov = self.take_best_orders(
