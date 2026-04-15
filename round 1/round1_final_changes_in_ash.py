@@ -96,15 +96,15 @@ PARAMS = {
     # FINAL TUNED PARAMS (Round 1, 3-day backtest: 174,875, worst day 42,802)
     # ─────────────────────────────────────────────────────────────────────
     ASH: {
-        # ASH: Max-aggression fair value — microprice base + EMA reversion + L2-L1.
-        # fair = microprice - 0.40*(l1_mid-ema) + 2.0*(l2m-l1m)
+        # ASH: Inventory-skewed fair value — microprice base + EMA reversion + L2-L1 + skew.
+        # fair = microprice - 0.40*(l1_mid-ema) + 2.0*(l2m-l1m) - 0.3*position
         # microprice = (ask*bid_vol + bid*ask_vol)/(bid_vol+ask_vol)
         #            = l1_mid + (spread/2)*imb ≈ l1_mid + 8*imb (spread≈16)
         # OFI removed: live test showed it hurt performance (−123 PnL, 136945 vs 136480).
-        # default_edge=5: quote at ±5 vs MM at ±8, deeper inside spread → more fills.
-        #   At 5-tick edge, each round-trip earns 5; at spread=16 that's 62.5% of half-spread.
-        # take_width=1: take any ask ≤ fair-1 (slightly more aggressive capture).
-        # adverse_volume=20: ASH avg L1 volume ≈14; was skipping 15-20 blocks unnecessarily.
+        # Aggressive params (take_width=1, adverse_volume=20, default_edge=5) reverted:
+        #   lived test 138570 showed they degraded ASH PnL 3047 → 2862. Root cause: the
+        #   penny-improve logic overrides default_edge anyway; take_width=1 increased adverse
+        #   fills. The REAL fix is inventory skewing to prevent ±40 position swings.
         'fair_mode': 'ema_reversion',
         'ema_alpha': 0.08,
         'reversion_coef': 0.40,
@@ -112,16 +112,20 @@ PARAMS = {
         'l2l1_coef': 2.0,           # independent signal (corr 0.63-0.65)
         'use_microprice': True,     # vol-weighted mid: mid + (spread/2)*imb
         'ofi_coef': 0.0,            # OFI removed: calibration-free, hurt in live test
-        'take_width': 1,            # AGGRESSIVE: was 2; take asks ≤ fair-1
+        'take_width': 2,            # reverted: aggressive take_width=1 hurt (more adverse fills)
         'clear_width': 1,
         'prevent_adverse': True,
-        'adverse_volume': 20,       # AGGRESSIVE: was 15; trade bigger blocks
+        'adverse_volume': 15,       # reverted: avg L1 vol=14; trading 15-20 blocks was adverse
         'disregard_edge': 1,
         'join_edge': 0,
-        'default_edge': 5,          # AGGRESSIVE: was 7; quote at ±5 vs MM ±8
+        'default_edge': 7,          # reverted: penny-improve overrides this anyway; 5 no better
         'soft_position_limit': 78,
         'levels': 2,
         'use_l2l1_signal': True,
+        'skew_coef': 0.3,           # FUNDAMENTAL FIX: fair -= 0.3*pos (inventory skewing)
+                                    # At pos=+40: fair drops 12 ticks → sell more aggressively
+                                    # At pos=-40: fair rises 12 ticks → buy more aggressively
+                                    # Prevents ±40 inventory swings observed in live logs.
     },
     PEPPER: {
         # PEPPER: Pure long drift strategy. Never sell.
@@ -478,6 +482,15 @@ class Trader:
         # Apply drift (PEPPER only)
         if p.get('use_drift', False):
             fair += PEPPER_DRIFT_PER_TICK
+
+        # Inventory skewing: bias fair value against current position.
+        # When long (+pos), lower fair → more aggressive selling / less buying.
+        # When short (-pos), raise fair → more aggressive buying / less selling.
+        # This is the standard MM solution to prevent large inventory accumulation.
+        # skew_coef=0.3: at pos=+40, fair drops 12 ticks (≈0.75 half-spreads).
+        skew_coef = p.get('skew_coef', 0.0)
+        if skew_coef != 0.0:
+            fair -= skew_coef * state.position.get(product, 0)
 
         trader_obj[last_fair_key] = fair
         return fair
