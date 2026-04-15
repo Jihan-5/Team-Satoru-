@@ -24,6 +24,15 @@ DATA ANALYSIS (3-day deep analysis, days -2/-1/0):
       holding max-long and marking up with the +1000/day drift.
       Max theoretical: 80 × 1000 = 80,000/day.
 
+  ASH FAIR VALUE MODEL (v2 — improved):
+    - fair = microprice - 0.40*(l1_mid-ema) + 2.0*(l2m-l1m) + 0.10*ofi
+    - microprice = (ask*bid_vol + bid*ask_vol)/(bid_vol+ask_vol)
+               = l1_mid + (spread/2)*imb ≈ l1_mid + 8*imb (spread≈16)
+    - OLS imb coef was ≈8.5 (shrunk to 3.5 previously); microprice recovers
+      ≈8x naturally AND adapts when spread widens to 18-19 ticks.
+    - ofi = delta_bid_queue - delta_ask_queue: captures order book FLOW,
+      independent from static imbalance snapshot.
+
 7 IMPROVEMENTS vs v1:
 
   1. EMA stale-state reset: if |mid - ema| > 50, hard-reset EMA to mid.
@@ -87,17 +96,21 @@ PARAMS = {
     # FINAL TUNED PARAMS (Round 1, 3-day backtest: 174,875, worst day 42,802)
     # ─────────────────────────────────────────────────────────────────────
     ASH: {
-        # ASH: Combined fair value model — EMA reversion + imbalance + L2-L1 signal.
-        # fair = mid - 0.40*(mid-ema) + 3.5*imb + 2.0*(l2m-l1m)
-        # OLS slopes: imb≈8.5 shrunk to 3.5; l2l1≈2.28 shrunk to 2.0.
+        # ASH: Improved fair value — microprice base + OFI + EMA reversion + L2-L1.
+        # fair = microprice - 0.40*(l1_mid-ema) + 2.0*(l2m-l1m) + 0.10*ofi
+        # microprice = (ask*bid_vol + bid*ask_vol)/(bid_vol+ask_vol)
+        #            = l1_mid + (spread/2)*imb ≈ l1_mid + 8*imb (spread≈16)
+        # OLS imb_coef ≈8.5; microprice recovers ≈8x (adapts to spread).
+        # imb_coef=0: microprice captures L1 imbalance natively.
+        # ofi_coef=0.10: order flow imbalance (delta bid queue - delta ask queue).
         # default_edge=7: penny-improve MM who posts at ±8 from fair.
-        # TUNED: ema_alpha=0.08 (smoother EMA → stronger reversion signal),
-        #        soft_position_limit=78 (near-max inventory → more passive fills).
         'fair_mode': 'ema_reversion',
         'ema_alpha': 0.08,
         'reversion_coef': 0.40,
-        'imb_coef': 3.5,
-        'l2l1_coef': 2.0,          # combined signal (corr 0.63-0.65)
+        'imb_coef': 0.0,            # zeroed: microprice captures L1 imbalance
+        'l2l1_coef': 2.0,           # independent signal (corr 0.63-0.65)
+        'use_microprice': True,     # vol-weighted mid: mid + (spread/2)*imb
+        'ofi_coef': 0.10,           # order flow imbalance (delta queues tick-to-tick)
         'take_width': 2,
         'clear_width': 1,
         'prevent_adverse': True,
@@ -348,10 +361,11 @@ class Trader:
         """Compute fair value using OLS-derived reversion models.
 
         ASH ('ema_reversion' mode):
-            ema[t] = alpha*mid + (1-alpha)*ema[t-1]
-            fair = mid - reversion_coef * (mid - ema) + imb_coef * volume_imbalance
-                 = (1-rc)*mid + rc*ema + ic*imb
-            Optimal: alpha=0.10, rc=0.50, ic=3.5. R² ~0.45.
+            ema[t] = alpha*l1_mid + (1-alpha)*ema[t-1]  (EMA on simple mid)
+            microprice = (ask*bid_vol + bid*ask_vol) / (bid_vol + ask_vol)
+                       = l1_mid + (spread/2)*imb  [vol-weighted mid]
+            fair = microprice - rc*(l1_mid-ema) + l2l1_coef*(l2m-l1m) + ofi_coef*ofi
+            OFI = delta_bid_queue - delta_ask_queue (price-adjusted, stored in traderData).
 
         PEPPER ('drift_plus_reversion' mode):
             drift_per_tick = 0.1 (deterministic, confirmed 3/3 days)
@@ -396,20 +410,27 @@ class Trader:
         # Residual from EMA
         residual = l1_mid - ema
 
-        # Volume imbalance at L1
+        # Volume at L1
         bid_vol = abs(order_depth.buy_orders.get(best_bid, 0))
         ask_vol = abs(order_depth.sell_orders.get(best_ask, 0))
         total = bid_vol + ask_vol
         imb = (bid_vol - ask_vol) / total if total > 0 else 0
 
-        # Start from the current mid
-        fair = l1_mid
+        # Base: microprice (vol-weighted mid) if enabled, else simple mid.
+        # microprice = l1_mid + (spread/2)*imb ≈ l1_mid + 8*imb for ASH (spread≈16).
+        # OLS estimated imb_coef = 8.5; microprice recovers ≈8x and adapts to spread.
+        if p.get('use_microprice', False) and total > 0:
+            base = (best_ask * bid_vol + best_bid * ask_vol) / total
+        else:
+            base = l1_mid
+
+        fair = base
 
         # Apply reversion correction (pulls fair toward EMA when mid is far)
         rev_coef = p.get('reversion_coef', 0.50)
         fair -= rev_coef * residual
 
-        # Apply imbalance correction
+        # Apply explicit imbalance correction (0 when using microprice, which already captures it)
         imb_coef = p.get('imb_coef', 0.0)
         fair += imb_coef * imb
 
@@ -425,6 +446,33 @@ class Trader:
                     fair += l2l1_coef * (l2m - l1_mid)
             except Exception:
                 pass
+
+        # OFI (Order Flow Imbalance): delta bid queue − delta ask queue tick-to-tick.
+        # Captures order book FLOW — independent from static imbalance snapshot.
+        # Standard formula: price-adjusted queue changes at the best level.
+        ofi_coef = p.get('ofi_coef', 0.0)
+        if ofi_coef != 0.0:
+            ofi_key = f'{product}_prev_book'
+            prev_book = trader_obj.get(ofi_key)
+            ofi = 0.0
+            if prev_book is not None:
+                pb, pbv, pa, pav = prev_book
+                # Guard against day-boundary price jumps contaminating OFI
+                if abs(best_bid - pb) + abs(best_ask - pa) < 50:
+                    if best_bid > pb:
+                        ofi += bid_vol          # bid price rose → all new queue
+                    elif best_bid == pb:
+                        ofi += (bid_vol - pbv)  # same level → delta volume
+                    else:
+                        ofi -= pbv              # bid price fell → lost old queue
+                    if best_ask < pa:
+                        ofi -= ask_vol          # ask price fell → all new queue
+                    elif best_ask == pa:
+                        ofi -= (ask_vol - pav)  # same level → delta volume
+                    else:
+                        ofi += pav              # ask price rose → lost old queue
+            trader_obj[f'{product}_prev_book'] = [best_bid, bid_vol, best_ask, ask_vol]
+            fair += ofi_coef * ofi
 
         # Apply drift (PEPPER only)
         if p.get('use_drift', False):
