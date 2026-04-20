@@ -50,10 +50,10 @@ PARAMS = {
         'ofi_coef': 0.0,
         'kf_Q': 1.0,
         'kf_R': 64.0,
-        'take_width': 2,             # sweet spot: avoids marginal takes
+        'take_width': 5,             # OPTIMAL: only take 5+ tick mispricings
         'clear_width': 1,
         'prevent_adverse': True,
-        'adverse_volume': 30,        # bigger than old 20, catches more blocks
+        'adverse_volume': 20,        # proven optimal
         'disregard_edge': 1,
         'join_edge': 0,
         'default_edge': 5,           # proven optimal on backtester
