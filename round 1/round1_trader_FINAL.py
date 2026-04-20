@@ -1,19 +1,19 @@
-"""Round 1 - AGGRESSIVE MAX-VOLUME STRATEGY
+"""Round 1 trader - ASH_COATED_OSMIUM + INTARIAN_PEPPER_ROOT.
 
-Target: Max Drawdown ~490, Recovery ~22, PnL ~11,000+
+AGGRESSIVE v3 - MAXIMIZE FILLS & POSITION SIZE
 
-Top team analysis:
-  #1: PnL 12,386, DD 423, Recovery 29, AvgFill 5.84
-  #5: PnL 12,060, DD 570, Recovery 21, AvgFill 5.42
-  Us: PnL  9,288, DD 344, Recovery 27, AvgFill 5.94
+Key insight from leaderboard analysis:
+  - Top teams: Max Drawdown 570, Avg Fill 5.84, PnL 12,386
+  - Our v2:   Max Drawdown 378, PnL ~9,230
+  - Diagnosis: pos_time={'0-20': 642, '20-40': 226, '40-60': 0, '60-80': 0, 'neg': 132}
+  - We NEVER hold 40+ on ASH. Top teams run much larger positions.
 
-Problem: We have BETTER avg fill (5.94 vs 5.5) but way less volume.
-We cherry-pick trades instead of running large positions.
-ASH gap: ~1,746 vs top ~4,500 = we're leaving ~2,750 on the table.
+CHANGES:
+  ASH: take_width 2->0, default_edge 5->3, soft_pos_limit 50->78,
+       adverse_vol 20->50, levels 2->3, removed wide-spread filter
+  PEPPER: take_width -8->-15, prevent_adverse->False, default_edge -6->-12, levels 4->6
 
-Solution: Quote as tight as possible, take everything, hold max inventory.
-The backtester misleads because it has no competition for fills.
-On the real platform, tight quotes = more fills = more PnL.
+POSITION LIMITS: 80 per product.
 """
 from datamodel import OrderDepth, TradingState, Order
 try:
@@ -28,9 +28,15 @@ except ImportError:
 import json
 from typing import Any, List
 
+
+# =========================================================================
+# Config
+# =========================================================================
 ASH = 'ASH_COATED_OSMIUM'
 PEPPER = 'INTARIAN_PEPPER_ROOT'
+
 POS_LIMITS = {ASH: 80, PEPPER: 80}
+
 PEPPER_DRIFT_PER_TICK = 0.1
 
 PARAMS = {
@@ -41,15 +47,16 @@ PARAMS = {
         'imb_coef': 0.0,
         'l2l1_coef': 0.0,
         'use_microprice': True,
+        'ofi_coef': 0.0,
         'kf_Q': 1.0,
         'kf_R': 64.0,
-        'take_width': 1,             # AGGRESSIVE: take 1-tick edge (was 5)
+        'take_width': 1,             # AGGRESSIVE: take 1-tick edge
         'clear_width': 1,
         'prevent_adverse': True,
         'adverse_volume': 50,        # don't filter anything reasonable
         'disregard_edge': 1,
         'join_edge': 0,
-        'default_edge': 2,           # VERY TIGHT: penny-improve hard (was 5)
+        'default_edge': 2,           # VERY TIGHT: penny-improve hard
         'soft_position_limit': 80,   # NO position mgmt - hold max
         'levels': 3,
         'use_l2l1_signal': True,
@@ -61,15 +68,15 @@ PARAMS = {
         'reversion_coef': 0.60,
         'imb_coef': 0,
         'l2l1_coef': 0,
-        'take_width': -15,
+        'take_width': -15,           # AGGRESSIVE: take any ask within 15 of fair
         'clear_width': 1,
-        'prevent_adverse': False,
+        'prevent_adverse': False,    # take EVERYTHING for PEPPER
         'adverse_volume': 15,
         'disregard_edge': 1,
         'join_edge': 0,
-        'default_edge': -10,
+        'default_edge': -10,         # aggressive bid (was -6)
         'soft_position_limit': 80,
-        'levels': 5,
+        'levels': 5,                 # deeper passive bids
         'use_drift': True,
         'use_l2l1_signal': True,
         'buy_only': True,
@@ -78,6 +85,9 @@ PARAMS = {
 }
 
 
+# =========================================================================
+# Logger
+# =========================================================================
 class Logger:
     def __init__(self) -> None:
         self.logs: str = ""
@@ -141,11 +151,12 @@ class Logger:
 logger = Logger()
 
 
+# =========================================================================
+# Trader
+# =========================================================================
 class Trader:
     def __init__(self, params=None):
-        if params is None:
-            params = PARAMS
-        self.params = params
+        self.params = params if params is not None else PARAMS
 
     def bid(self):
         return 2000
@@ -157,7 +168,7 @@ class Trader:
     ):
         limit = POS_LIMITS[product]
 
-        # Take ALL sell levels that are below fair - take_width
+        # Sweep ALL sell levels below fair - take_width
         if order_depth.sell_orders:
             for ask_price in sorted(order_depth.sell_orders.keys()):
                 if ask_price > fair_value - take_width:
@@ -170,7 +181,7 @@ class Trader:
                     orders.append(Order(product, ask_price, qty))
                     buy_order_volume += qty
 
-        # Take ALL buy levels above fair + take_width
+        # Sweep ALL buy levels above fair + take_width
         if not buy_only and order_depth.buy_orders:
             for bid_price in sorted(order_depth.buy_orders.keys(), reverse=True):
                 if bid_price < fair_value + take_width:
@@ -199,8 +210,7 @@ class Trader:
 
         if position_after_take > 0:
             clear_qty = sum(
-                volume for price, volume in order_depth.buy_orders.items()
-                if price >= fair_for_ask
+                v for p, v in order_depth.buy_orders.items() if p >= fair_for_ask
             )
             clear_qty = min(clear_qty, position_after_take)
             sent = min(sell_qty_cap, clear_qty)
@@ -210,8 +220,7 @@ class Trader:
 
         if position_after_take < 0:
             clear_qty = sum(
-                abs(volume) for price, volume in order_depth.sell_orders.items()
-                if price <= fair_for_bid
+                abs(v) for p, v in order_depth.sell_orders.items() if p <= fair_for_bid
             )
             clear_qty = min(clear_qty, abs(position_after_take))
             sent = min(buy_qty_cap, clear_qty)
@@ -231,27 +240,19 @@ class Trader:
         orders = []
         limit = POS_LIMITS[product]
 
-        asks_above_fair = [p for p in order_depth.sell_orders.keys()
-                           if p > fair_value + disregard_edge]
-        bids_below_fair = [p for p in order_depth.buy_orders.keys()
-                           if p < fair_value - disregard_edge]
+        asks_above = [p for p in order_depth.sell_orders if p > fair_value + disregard_edge]
+        bids_below = [p for p in order_depth.buy_orders if p < fair_value - disregard_edge]
 
-        best_ask_above_fair = min(asks_above_fair) if asks_above_fair else None
-        best_bid_below_fair = max(bids_below_fair) if bids_below_fair else None
+        best_ask_above = min(asks_above) if asks_above else None
+        best_bid_below = max(bids_below) if bids_below else None
 
         ask = round(fair_value + default_edge)
-        if best_ask_above_fair is not None:
-            if abs(best_ask_above_fair - fair_value) <= join_edge:
-                ask = best_ask_above_fair
-            else:
-                ask = best_ask_above_fair - 1
+        if best_ask_above is not None:
+            ask = best_ask_above if abs(best_ask_above - fair_value) <= join_edge else best_ask_above - 1
 
         bid = round(fair_value - default_edge)
-        if best_bid_below_fair is not None:
-            if abs(fair_value - best_bid_below_fair) <= join_edge:
-                bid = best_bid_below_fair
-            else:
-                bid = best_bid_below_fair + 1
+        if best_bid_below is not None:
+            bid = best_bid_below if abs(fair_value - best_bid_below) <= join_edge else best_bid_below + 1
 
         if manage_position:
             if position > soft_position_limit:
@@ -266,6 +267,7 @@ class Trader:
                 q = base if lvl < bid_levels - 1 else buy_qty - base * (bid_levels - 1)
                 if q > 0:
                     orders.append(Order(product, round(bid) - lvl, q))
+
         sell_qty = limit + (position - sell_order_volume)
         if sell_qty > 0 and ask_levels > 0:
             base = sell_qty // ask_levels
@@ -276,7 +278,7 @@ class Trader:
 
         return orders, buy_order_volume, sell_order_volume
 
-    def compute_fair(self, product, order_depth, trader_obj, state):
+    def compute_fair(self, product, order_depth, trader_obj):
         p = self.params[product]
         mode = p.get('fair_mode', 'ema_reversion')
         ema_key = f'{product}_ema'
@@ -297,6 +299,7 @@ class Trader:
         bid_vol = abs(order_depth.buy_orders.get(best_bid, 0))
         ask_vol = abs(order_depth.sell_orders.get(best_ask, 0))
         total = bid_vol + ask_vol
+        imb = (bid_vol - ask_vol) / total if total > 0 else 0
 
         # MM detection
         MM_LO, MM_HI = 8, 20
@@ -330,7 +333,7 @@ class Trader:
         else:
             base = micro
 
-        # Kalman filter for ASH
+        # ASH: Kalman filter
         if mode == 'kalman_reversion':
             kf_x_key = f'{product}_kf_x'
             kf_P_key = f'{product}_kf_P'
@@ -352,7 +355,7 @@ class Trader:
             trader_obj[last_fair_key] = fair
             return fair
 
-        # EMA reversion + drift for PEPPER
+        # PEPPER: EMA reversion + drift
         alpha = p.get('ema_alpha', 0.10)
         prev_ema = trader_obj.get(ema_key)
         if prev_ema is None or abs(l1_mid - prev_ema) > 50:
@@ -364,6 +367,7 @@ class Trader:
         residual = l1_mid - ema
         fair = base
         fair -= p.get('reversion_coef', 0.50) * residual
+        fair += p.get('imb_coef', 0.0) * imb
 
         if p.get('use_drift', False):
             fair += PEPPER_DRIFT_PER_TICK
@@ -387,7 +391,7 @@ class Trader:
             try:
                 trader_obj = json.loads(state.traderData)
             except Exception:
-                trader_obj = {}
+                pass
 
         result = {}
 
@@ -398,7 +402,7 @@ class Trader:
             pos = state.position.get(product, 0)
             od = state.order_depths[product]
 
-            fair = self.compute_fair(product, od, trader_obj, state)
+            fair = self.compute_fair(product, od, trader_obj)
             if fair is None:
                 continue
 
@@ -406,7 +410,7 @@ class Trader:
             bov = sov = 0
             buy_only = p.get('buy_only', False)
 
-            # Phase 1: Take - aggressively, ALL levels
+            # Phase 1: Take aggressively
             bov, sov = self.take_best_orders(
                 product, fair, p['take_width'], orders, od, pos, bov, sov,
                 prevent_adverse=p.get('prevent_adverse', False),
@@ -414,13 +418,13 @@ class Trader:
                 buy_only=buy_only,
             )
 
-            # Phase 2: Clear
+            # Phase 2: Clear (always, no smart skip)
             if not buy_only:
                 bov, sov = self.clear_position_order(
                     product, fair, p['clear_width'], orders, od, pos, bov, sov,
                 )
 
-            # L2-L1 asymmetric levels
+            # L2-L1 signal for asymmetric levels
             base_lvl = p.get('levels', 2)
             bid_lvl = ask_lvl = base_lvl
             if p.get('use_l2l1_signal', False):
@@ -434,6 +438,7 @@ class Trader:
 
             if buy_only:
                 ask_lvl = 0
+                # Spike-sell for PEPPER when at max position
                 spike_thresh = p.get('spike_sell_threshold', 0)
                 if spike_thresh > 0 and product == PEPPER:
                     if pos >= POS_LIMITS[product] and od.buy_orders and od.sell_orders:
@@ -445,10 +450,13 @@ class Trader:
                                 orders.append(Order(product, best_bid, -sell_qty))
                                 sov += sell_qty
 
-            # Phase 3: Make - TIGHT quotes
+            effective_edge = p['default_edge']
+            # NO wide-spread filter, NO asymmetric edge widening
+
+            # Phase 3: Make - tight quotes, deep levels
             make_orders, _, _ = self.make_orders(
                 product, od, fair, pos, bov, sov,
-                p['disregard_edge'], p['join_edge'], p['default_edge'],
+                p['disregard_edge'], p['join_edge'], effective_edge,
                 manage_position=True,
                 soft_position_limit=p['soft_position_limit'],
                 bid_levels=bid_lvl,

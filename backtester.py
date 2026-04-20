@@ -50,15 +50,15 @@ PARAMS = {
         'ofi_coef': 0.0,
         'kf_Q': 1.0,
         'kf_R': 64.0,
-        'take_width': 5,             # OPTIMAL: only take 5+ tick mispricings
+        'take_width': 1,             # AGGRESSIVE: take 1-tick edge
         'clear_width': 1,
         'prevent_adverse': True,
-        'adverse_volume': 20,        # proven optimal
+        'adverse_volume': 50,        # don't filter anything reasonable
         'disregard_edge': 1,
         'join_edge': 0,
-        'default_edge': 5,           # proven optimal on backtester
-        'soft_position_limit': 78,   # BIG CHANGE: hold near max (was 50)
-        'levels': 2,                 # proven optimal
+        'default_edge': 2,           # VERY TIGHT: penny-improve hard
+        'soft_position_limit': 80,   # NO position mgmt - hold max
+        'levels': 3,
         'use_l2l1_signal': True,
         'buy_only': False,
     },
@@ -168,31 +168,31 @@ class Trader:
     ):
         limit = POS_LIMITS[product]
 
+        # Sweep ALL sell levels below fair - take_width
         if order_depth.sell_orders:
-            best_ask = min(order_depth.sell_orders.keys())
-            best_ask_amt = -order_depth.sell_orders[best_ask]
-            if not prevent_adverse or best_ask_amt <= adverse_volume:
-                if best_ask <= fair_value - take_width:
-                    qty = min(best_ask_amt, limit - (position + buy_order_volume))
-                    if qty > 0:
-                        orders.append(Order(product, best_ask, qty))
-                        buy_order_volume += qty
-                        order_depth.sell_orders[best_ask] += qty
-                        if order_depth.sell_orders[best_ask] == 0:
-                            del order_depth.sell_orders[best_ask]
+            for ask_price in sorted(order_depth.sell_orders.keys()):
+                if ask_price > fair_value - take_width:
+                    break
+                ask_amt = -order_depth.sell_orders[ask_price]
+                if prevent_adverse and ask_amt > adverse_volume:
+                    continue
+                qty = min(ask_amt, limit - (position + buy_order_volume))
+                if qty > 0:
+                    orders.append(Order(product, ask_price, qty))
+                    buy_order_volume += qty
 
+        # Sweep ALL buy levels above fair + take_width
         if not buy_only and order_depth.buy_orders:
-            best_bid = max(order_depth.buy_orders.keys())
-            best_bid_amt = order_depth.buy_orders[best_bid]
-            if not prevent_adverse or best_bid_amt <= adverse_volume:
-                if best_bid >= fair_value + take_width:
-                    qty = min(best_bid_amt, limit + (position - sell_order_volume))
-                    if qty > 0:
-                        orders.append(Order(product, best_bid, -qty))
-                        sell_order_volume += qty
-                        order_depth.buy_orders[best_bid] -= qty
-                        if order_depth.buy_orders[best_bid] == 0:
-                            del order_depth.buy_orders[best_bid]
+            for bid_price in sorted(order_depth.buy_orders.keys(), reverse=True):
+                if bid_price < fair_value + take_width:
+                    break
+                bid_amt = order_depth.buy_orders[bid_price]
+                if prevent_adverse and bid_amt > adverse_volume:
+                    continue
+                qty = min(bid_amt, limit + (position - sell_order_volume))
+                if qty > 0:
+                    orders.append(Order(product, bid_price, -qty))
+                    sell_order_volume += qty
 
         return buy_order_volume, sell_order_volume
 
