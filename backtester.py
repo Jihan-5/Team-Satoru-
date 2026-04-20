@@ -1,19 +1,17 @@
 """Round 1 trader - ASH_COATED_OSMIUM + INTARIAN_PEPPER_ROOT.
 
-AGGRESSIVE v3 - MAXIMIZE FILLS & POSITION SIZE
+AGGRESSIVE v4 - TIGHTER QUOTES, MORE FILLS
 
-Key insight from leaderboard analysis:
-  - Top teams: Max Drawdown 570, Avg Fill 5.84, PnL 12,386
-  - Our v2:   Max Drawdown 378, PnL ~9,230
-  - Diagnosis: pos_time={'0-20': 642, '20-40': 226, '40-60': 0, '60-80': 0, 'neg': 132}
-  - We NEVER hold 40+ on ASH. Top teams run much larger positions.
+Leaderboard gap analysis (us #578 at 9,288 vs #1 at 12,386):
+  - Our AvgFill 5.94 is HIGHEST in top 20 => too selective
+  - Our MaxDD 344 vs median 507 => massive risk headroom unused
+  - Need ~712 more PnL to hit 10K target
 
-CHANGES:
-  ASH: take_width 2->0, default_edge 5->3, soft_pos_limit 50->78,
-       adverse_vol 20->50, levels 2->3, removed wide-spread filter
-  PEPPER: take_width -8->-15, prevent_adverse->False, default_edge -6->-12, levels 4->6
-
-POSITION LIMITS: 80 per product.
+v4 CHANGES from v3:
+  ASH: take_width 1->0 (take at fair), default_edge 2->1 (tightest quotes),
+       clear_width 1->2 (hold positions longer), kf_Q 1->2 (faster Kalman),
+       soft_position_limit 80->50 (inventory skew earlier)
+  PEPPER: spike_sell_threshold 5->8 (don't sell drift asset easily)
 """
 from datamodel import OrderDepth, TradingState, Order
 try:
@@ -48,16 +46,16 @@ PARAMS = {
         'l2l1_coef': 0.0,
         'use_microprice': True,
         'ofi_coef': 0.0,
-        'kf_Q': 1.0,
+        'kf_Q': 2.0,                # FASTER Kalman tracking (was 1.0)
         'kf_R': 64.0,
-        'take_width': 1,             # AGGRESSIVE: take 1-tick edge
-        'clear_width': 1,
+        'take_width': 0,             # TAKE AT FAIR VALUE (was 1)
+        'clear_width': 2,            # HOLD LONGER for mean reversion (was 1)
         'prevent_adverse': True,
-        'adverse_volume': 50,        # don't filter anything reasonable
+        'adverse_volume': 50,
         'disregard_edge': 1,
         'join_edge': 0,
-        'default_edge': 2,           # VERY TIGHT: penny-improve hard
-        'soft_position_limit': 80,   # NO position mgmt - hold max
+        'default_edge': 1,           # TIGHTEST QUOTES (was 2)
+        'soft_position_limit': 50,   # Inventory skew at 50 (was 80/never)
         'levels': 3,
         'use_l2l1_signal': True,
         'buy_only': False,
@@ -80,7 +78,7 @@ PARAMS = {
         'use_drift': True,
         'use_l2l1_signal': True,
         'buy_only': True,
-        'spike_sell_threshold': 5,
+        'spike_sell_threshold': 8,
     },
 }
 
